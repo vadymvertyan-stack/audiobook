@@ -1,0 +1,52 @@
+{
+	"name": "kilo-code-sound",
+	"displayName": "Kilo Code Sound Notifications",
+	"description": "Автоматичні звукові сповіщення при завершенні задач Kilo Code",
+	"version": "1.0.0",
+	"publisher": "local",
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"main": "./extension.js",
+	"contributes": {
+		"configuration": {
+			"title": "Kilo Code Sound Notifications",
+			"properties": {
+				"kiloCodeSound.enabled": {
+					"type": "boolean",
+					"default": true,
+					"description": "Увімкнути звукові сповіщення"
+				},
+				"kiloCodeSound.successSound": {
+					"type": "string",
+					"default": "C:\\Windows\\Media\\Windows Notify System Generic.wav",
+					"description": "Шлях до файлу звуку успіху"
+				},
+				"kiloCodeSound.errorSound": {
+					"type": "string",
+					"default": "C:\\Windows\\Media\\Windows Background.wav",
+					"description": "Шлях до файлу звуку помилки"
+				},
+				"kiloCodeSound.volume": {
+					"type": "number",
+					"default": 1.0,
+					"minimum": 0,
+					"maximum": 1,
+					"description": "Гучність звуку (0.0 - 1.0)"
+				}
+			}
+		}
+	},
+	"scripts": {
+		"test": "echo \"Error: no test specified\" && exit 1"
+	},
+	"devDependencies": {
+		"@types/vscode": "^1.85.0"
+	}
+}
