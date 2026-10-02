@@ -34,9 +34,10 @@ Configuration (env vars win, so it works under `colab exec --env`):
   AUDIOBOOK_OUT      path to write out.zip     (default /content/audiobook_out.zip)
   AUDIOBOOK_WORKDIR  scratch dir               (default /content/audiobook_job)
   AUDIOBOOK_ENGINE   override job.json engine  (omnivoice | voxcpm2 | dummy)
+  AUDIOBOOK_BATCH_GLOB  Kaggle mode: render every job_NN.zip matching this
+                        glob into AUDIOBOOK_BATCH_OUT/out_NN.zip
+                        (+ batch_report.json)
 """
-
-from __future__ import annotations
 
 import builtins
 import hashlib
@@ -464,13 +465,9 @@ def zip_dir(src: str, dst_zip: str) -> None:
                 z.write(full, os.path.relpath(full, src))
 
 
-def main() -> None:
-    job_zip = os.environ.get("AUDIOBOOK_JOB", "/content/audiobook_job.zip")
-    out_zip = os.environ.get("AUDIOBOOK_OUT", "/content/audiobook_out.zip")
-    workdir = os.environ.get("AUDIOBOOK_WORKDIR", "/content/audiobook_job")
-    engine_override = os.environ.get("AUDIOBOOK_ENGINE") or None
-
-    # Never let the server download the previous chapter's archive by mistake.
+def run_one(job_zip: str, out_zip: str, workdir: str, engine_override: Optional[str] = None) -> str:
+    """Render one job archive into one output archive. Returns the job id."""
+    # Never let the server download a previous chapter's archive by mistake.
     if os.path.exists(out_zip):
         os.remove(out_zip)
     job_dir = os.path.join(workdir, "job")
@@ -493,6 +490,60 @@ def main() -> None:
     render_job(job_dir, out_dir, engine_override)
     zip_dir(out_dir, out_zip)
     log(f"wrote {out_zip}")
+    return job_id
+
+
+def run_batch(pattern: str, out_root: str, workdir: str, engine_override: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Kaggle mode: render every job_NN.zip found, one out_NN.zip each.
+
+    One failing chapter does not stop the others; batch_report.json says
+    which ones finished, and is rewritten after every chapter.
+    """
+    import glob
+    import traceback
+
+    jobs = sorted(glob.glob(pattern, recursive=True))
+    log(f"batch: {len(jobs)} job(s) matching {pattern}")
+    os.makedirs(out_root, exist_ok=True)
+    report: List[Dict[str, Any]] = []
+    for job in jobs:
+        name = os.path.basename(job)
+        out_name = "out_" + name[len("job_"):] if name.startswith("job_") else "out_" + name
+        entry: Dict[str, Any] = {"job": name, "out": out_name}
+        try:
+            entry["job_id"] = run_one(job, os.path.join(out_root, out_name), workdir, engine_override)
+            entry["ok"] = True
+        except (Exception, SystemExit) as e:  # SystemExit: render_job's input checks
+            entry["ok"] = False
+            entry["error"] = f"{type(e).__name__}: {e}"
+            entry["traceback"] = traceback.format_exc()[-3000:]
+            log(f"FAILED {name}: {entry['error']}")
+        report.append(entry)
+        with open(os.path.join(out_root, "batch_report.json"), "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+    return report
+
+
+def main() -> None:
+    engine_override = os.environ.get("AUDIOBOOK_ENGINE") or None
+    batch_glob = os.environ.get("AUDIOBOOK_BATCH_GLOB")
+    if batch_glob:
+        import tempfile
+
+        run_batch(
+            batch_glob,
+            os.environ.get("AUDIOBOOK_BATCH_OUT", "/kaggle/working"),
+            os.environ.get("AUDIOBOOK_WORKDIR", os.path.join(tempfile.gettempdir(), "audiobook_job")),
+            engine_override,
+        )
+        return
+
+    job_id = run_one(
+        os.environ.get("AUDIOBOOK_JOB", "/content/audiobook_job.zip"),
+        os.environ.get("AUDIOBOOK_OUT", "/content/audiobook_out.zip"),
+        os.environ.get("AUDIOBOOK_WORKDIR", "/content/audiobook_job"),
+        engine_override,
+    )
     # `colab exec` exits 0 even when the kernel raised, so the server looks
     # for this exact line to know the chapter really finished.
     print(f"{DONE_MARKER} {job_id}", flush=True)

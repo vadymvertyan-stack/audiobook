@@ -1,6 +1,6 @@
 ---
 name: audiobook-colab
-description: Turn a book into a multi-voice audio play on a Colab GPU via the Colab CLI, keep each character's voice fixed, and make sure no Colab session is left burning compute units.
+description: Turn a book into a multi-voice audio play on a Colab or Kaggle GPU, keep each character's voice fixed, and make sure no Colab session is left burning compute units.
 ---
 
 # Audiobook on Colab
@@ -78,6 +78,9 @@ python3 ~/audiobook/colab_render/orchestrate.py render ~/audiobook-data/books/<s
 - Re-running the same command skips chapters that are already done. Use it
   after a failure instead of `--force`.
 - Never pass `--keep` unless the user explicitly wants the VM left running.
+- While `usage` shows 0 compute units, add `--backend kaggle` (needs
+  `~/.kaggle/kaggle.json`). The command then waits until the Kaggle run
+  finishes, which can take hours; there is no session to stop.
 
 Every chapter folder contains `chapter.mp3` (or `chapter.wav`), `stems/` (one
 track per voice, for adding background sound) and `manifest.json`. Send the

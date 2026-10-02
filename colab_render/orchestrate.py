@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Server-side driver for rendering audiobooks on Colab through the official
-Colab CLI (https://github.com/googlecolab/google-colab-cli).
+Colab CLI (https://github.com/googlecolab/google-colab-cli), or on Kaggle
+through the official Kaggle CLI (--backend kaggle).
 
 Runs on your own Linux server (the Colab CLI has no Windows build), needs only
 the Python standard library, and talks to Colab exclusively through the
@@ -13,6 +14,7 @@ Commands (all print JSON on the last line, so an agent can parse them):
 
   plan      BOOK --voices V           check the script and voices, no GPU
   render    BOOK --voices V --out DIR render every chapter on a Colab GPU
+            ... --backend kaggle          or as one background Kaggle notebook run
   assemble  CHAPTER_DIR               rebuild chapter.wav + stems from lines/
   usage                               compute-unit balance and burn rate
   watchdog  [--stop]                  find sessions nobody is using; stop them
@@ -309,12 +311,15 @@ def assemble(chapter_dir: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 class ColabError(RuntimeError):
-    pass
+    """A `colab` or `kaggle` command failed."""
 
 
-class Colab:
+class Cli:
+    env_var = ""
+    default = ""
+
     def __init__(self, binary: Optional[str] = None):
-        self.bin = binary or os.environ.get("COLAB_BIN", "colab")
+        self.bin = binary or os.environ.get(self.env_var, self.default)
 
     def run(self, *args: str, timeout: Optional[float] = None, stream: bool = False) -> str:
         cmd = [self.bin, *args]
@@ -334,6 +339,11 @@ class Colab:
         if code != 0:
             raise ColabError(f"{' '.join(cmd)} failed ({code}):\n{out[-2000:]}")
         return out
+
+
+class Colab(Cli):
+    env_var = "COLAB_BIN"
+    default = "colab"
 
     def usage(self) -> Dict[str, Any]:
         out = self.run("usage")
@@ -364,6 +374,43 @@ def read_text(path: str) -> Optional[str]:
             return f.read().strip()
     except OSError:
         return None
+
+
+class Kaggle(Cli):
+    """Kaggle has no live session: inputs go up as a private dataset, the
+    render runs as a background notebook version, outputs come back after."""
+
+    env_var = "KAGGLE_BIN"
+    default = "kaggle"
+
+    @staticmethod
+    def username(explicit: Optional[str] = None) -> Optional[str]:
+        if explicit:
+            return explicit
+        if os.environ.get("KAGGLE_USERNAME"):
+            return os.environ["KAGGLE_USERNAME"]
+        cfg_dir = os.environ.get("KAGGLE_CONFIG_DIR", os.path.expanduser("~/.kaggle"))
+        try:
+            with open(os.path.join(cfg_dir, "kaggle.json"), encoding="utf-8") as f:
+                return json.load(f).get("username")
+        except (OSError, ValueError):
+            return None
+
+    def status_word(self, *args: str) -> str:
+        """Last word of `... status`, lowercased: complete, running, ready, error, ..."""
+        out = self.run(*args, timeout=120).strip().lower()
+        m = re.findall(r"[a-z_]+", out.splitlines()[0] if out else "")
+        return m[-1] if m else out
+
+    def wait(self, args: List[str], done: set, failed: set, poll: float, max_seconds: float) -> str:
+        deadline = time.time() + max_seconds
+        while True:
+            word = self.status_word(*args)
+            if word in done or word in failed:
+                return word
+            if time.time() > deadline:
+                raise ColabError(f"timed out waiting for {' '.join(args)} (last status: {word})")
+            time.sleep(poll)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -431,19 +478,33 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0 if not problems else 2
 
 
+def finish_chapter(ch: Dict[str, Any], ch_dir: str, out_zip: str, job_id: str, started: float) -> Dict[str, Any]:
+    if os.path.isdir(ch_dir):
+        shutil.rmtree(ch_dir)
+    with zipfile.ZipFile(out_zip) as z:
+        z.extractall(ch_dir)
+    info = assemble(ch_dir)
+    with open(os.path.join(ch_dir, ".job_id"), "w") as f:
+        f.write(job_id)
+    info.update({"index": ch["index"], "title": ch["title"], "wall_seconds": round(time.time() - started, 1)})
+    note(f"chapter {ch['index']} done: {info['seconds'] / 60:.1f} min of audio")
+    return info
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     chapters, voices = load_book(args)
     problems = check_voices(chapters, voices)
+    if args.backend == "kaggle" and not Kaggle.username(args.kaggle_user):
+        problems.append("Kaggle username unknown: put kaggle.json in ~/.kaggle or pass --kaggle-user")
     if problems:
         emit({"ok": False, "problems": problems})
         return 2
     settings = load_settings(args)
     os.makedirs(args.out, exist_ok=True)
-    colab = Colab(args.colab_bin)
 
     lock = read_lock()
     if lock and _pid_alive(int(lock.get("pid", -1))):
-        emit({"ok": False, "problems": [f"another render is running (pid {lock['pid']}, session {lock['session']})"]})
+        emit({"ok": False, "problems": [f"another render is running (pid {lock['pid']}, {lock.get('session')})"]})
         return 3
 
     todo = []
@@ -458,15 +519,36 @@ def cmd_render(args: argparse.Namespace) -> int:
             continue
         todo.append((ch, ch_dir, tmp_zip, job_id))
 
-    results = []
     if not todo:
         emit({"ok": True, "rendered": [], "note": "nothing to do"})
         return 0
 
-    session = args.session or f"audiobook-{time.strftime('%m%d-%H%M%S')}"
     os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        if args.backend == "kaggle":
+            return _render_kaggle(args, todo)
+        return _render_colab(args, todo)
+    finally:
+        for _, _, tmp_zip, _ in todo:
+            if os.path.exists(tmp_zip):
+                os.remove(tmp_zip)
+        try:
+            os.remove(LOCK_PATH)
+        except OSError:
+            pass
+
+
+def _write_lock(session: str, args: argparse.Namespace) -> None:
     with open(LOCK_PATH, "w", encoding="utf-8") as f:
-        json.dump({"pid": os.getpid(), "session": session, "started": time.time(), "book": args.book}, f)
+        json.dump({"pid": os.getpid(), "session": session, "backend": args.backend,
+                   "started": time.time(), "book": args.book}, f)
+
+
+def _render_colab(args: argparse.Namespace, todo: List[tuple]) -> int:
+    colab = Colab(args.colab_bin)
+    results = []
+    session = args.session or f"audiobook-{time.strftime('%m%d-%H%M%S')}"
+    _write_lock(session, args)
     created = False
     try:
         new_args = ["new", "-s", session]
@@ -490,34 +572,118 @@ def cmd_render(args: argparse.Namespace) -> int:
                 raise ColabError(f"chapter {ch['index']} did not finish on the VM:\n{exec_out[-2000:]}")
             out_zip = tmp_zip.replace("_job_", "_out_")
             colab.run("download", "-s", session, REMOTE_OUT, out_zip, timeout=1800)
-            if os.path.isdir(ch_dir):
-                shutil.rmtree(ch_dir)
-            with zipfile.ZipFile(out_zip) as z:
-                z.extractall(ch_dir)
-            info = assemble(ch_dir)
-            with open(os.path.join(ch_dir, ".job_id"), "w") as f:
-                f.write(job_id)
+            results.append(finish_chapter(ch, ch_dir, out_zip, job_id, started))
             os.remove(out_zip)
-            info.update({"index": ch["index"], "title": ch["title"], "wall_seconds": round(time.time() - started, 1)})
-            results.append(info)
-            note(f"chapter {ch['index']} done: {info['seconds'] / 60:.1f} min of audio")
     except (ColabError, subprocess.TimeoutExpired, zipfile.BadZipFile, OSError) as e:
         emit({"ok": False, "rendered": results, "error": str(e)[-1500:]})
         return 1
     finally:
-        for _, _, tmp_zip, _ in todo:
-            if os.path.exists(tmp_zip):
-                os.remove(tmp_zip)
         if created and not args.keep:
             try:
                 colab.run("stop", "-s", session, timeout=300)
             except (ColabError, subprocess.TimeoutExpired) as e:
                 note(f"WARNING: could not stop session {session}: {e}. Run `orchestrate.py watchdog --stop`.")
+    emit({"ok": True, "backend": "colab", "session": session, "kept": bool(args.keep), "rendered": results})
+    return 0
+
+
+KAGGLE_HEADER = """# Generated by orchestrate.py: render_chapter.py in batch mode for Kaggle.
+import os
+os.environ.setdefault("AUDIOBOOK_BATCH_GLOB", "/kaggle/input/**/job_*.zip")
+os.environ.setdefault("AUDIOBOOK_BATCH_OUT", "/kaggle/working")
+"""
+
+
+def _render_kaggle(args: argparse.Namespace, todo: List[tuple]) -> int:
+    kaggle = Kaggle(args.kaggle_bin)
+    user = Kaggle.username(args.kaggle_user)
+    dataset_id = f"{user}/{args.kaggle_dataset}"
+    kernel_id = f"{user}/{args.kaggle_kernel}"
+    _write_lock(kernel_id, args)
+    work = tempfile.mkdtemp(prefix="audiobook_kaggle_")
+    results: List[Dict[str, Any]] = []
+    started = time.time()
+    try:
+        # 1. Inputs: every chapter's job archive in one private dataset version.
+        ds_dir = os.path.join(work, "dataset")
+        os.makedirs(ds_dir)
+        for ch, _, tmp_zip, _ in todo:
+            shutil.copy(tmp_zip, os.path.join(ds_dir, f"job_{ch['index']:03d}.zip"))
+        with open(os.path.join(ds_dir, "dataset-metadata.json"), "w", encoding="utf-8") as f:
+            json.dump({"title": args.kaggle_dataset, "id": dataset_id, "licenses": [{"name": "CC0-1.0"}]}, f)
         try:
-            os.remove(LOCK_PATH)
-        except OSError:
-            pass
-    emit({"ok": True, "session": session, "kept": bool(args.keep), "rendered": results})
+            kaggle.run("datasets", "status", dataset_id, timeout=120)
+            exists = True
+        except ColabError:
+            exists = False
+        created_ds = False
+        if exists:
+            try:
+                kaggle.run("datasets", "version", "-p", ds_dir, "-m",
+                           f"audiobook jobs {time.strftime('%Y-%m-%d %H:%M')}", "-q", timeout=1800)
+                created_ds = True
+            except ColabError as e:
+                note(f"dataset version failed, trying create: {e}")
+        if not created_ds:
+            kaggle.run("datasets", "create", "-p", ds_dir, "-q", timeout=1800)
+        kaggle.wait(["datasets", "status", dataset_id], {"ready"}, {"failed", "deleted"},
+                    args.poll_seconds, 30 * 60)
+
+        # 2. The render: a private script notebook with GPU and internet (for pip + model download).
+        k_dir = os.path.join(work, "kernel")
+        os.makedirs(k_dir)
+        with open(RENDER_SCRIPT, encoding="utf-8") as f:
+            source = f.read()
+        with open(os.path.join(k_dir, "render.py"), "w", encoding="utf-8") as f:
+            f.write(KAGGLE_HEADER + source)
+        with open(os.path.join(k_dir, "kernel-metadata.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "id": kernel_id, "title": args.kaggle_kernel, "code_file": "render.py",
+                "language": "python", "kernel_type": "script", "is_private": True,
+                "enable_gpu": True, "enable_internet": True, "dataset_sources": [dataset_id],
+            }, f)
+        kaggle.run("kernels", "push", "-p", k_dir, "--accelerator", args.kaggle_accelerator,
+                   "-t", str(args.kaggle_max_hours * 3600), timeout=600)
+        note(f"rendering on Kaggle: https://www.kaggle.com/code/{kernel_id}")
+        final = kaggle.wait(["kernels", "status", kernel_id], {"complete"},
+                            {"error", "cancel_requested", "cancel_acknowledged"},
+                            args.poll_seconds, args.kaggle_max_hours * 3600 + 1800)
+
+        # 3. Outputs (also after an error: finished chapters are kept).
+        out_dir = os.path.join(work, "output")
+        os.makedirs(out_dir)
+        kaggle.run("kernels", "output", kernel_id, "-p", out_dir, "-o", timeout=3600)
+        try:
+            with open(os.path.join(out_dir, "batch_report.json"), encoding="utf-8") as f:
+                report = {r["job"]: r for r in json.load(f)}
+        except (OSError, ValueError):
+            report = {}
+        failures = []
+        for ch, ch_dir, _, job_id in todo:
+            name = f"job_{ch['index']:03d}.zip"
+            entry = report.get(name)
+            out_zip = os.path.join(out_dir, f"out_{ch['index']:03d}.zip")
+            if not entry or not entry.get("ok") or not os.path.exists(out_zip):
+                failures.append({"index": ch["index"], "error": (entry or {}).get("error", "no output")})
+            elif entry.get("job_id") != job_id:
+                # The notebook saw an older dataset version.
+                failures.append({"index": ch["index"], "error": "stale input on Kaggle, run again"})
+            else:
+                results.append(finish_chapter(ch, ch_dir, out_zip, job_id, started))
+        if final != "complete" or failures:
+            log_tail = ""
+            for name in os.listdir(out_dir):
+                if name.endswith(".log"):
+                    log_tail = read_text(os.path.join(out_dir, name)) or ""
+            emit({"ok": False, "backend": "kaggle", "kernel": kernel_id, "status": final,
+                  "rendered": results, "failed": failures, "log_tail": log_tail[-1500:]})
+            return 1
+    except (ColabError, subprocess.TimeoutExpired, zipfile.BadZipFile, OSError) as e:
+        emit({"ok": False, "backend": "kaggle", "rendered": results, "error": str(e)[-1500:]})
+        return 1
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    emit({"ok": True, "backend": "kaggle", "kernel": kernel_id, "rendered": results})
     return 0
 
 
@@ -597,7 +763,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--session", default=None, help="Colab session name")
     sp.add_argument("--keep", action="store_true", help="leave the session running afterwards (it keeps billing)")
     sp.add_argument("--force", action="store_true", help="re-render chapters that are already done")
-    sp.add_argument("--chapter-timeout", type=int, default=6 * 3600, help="seconds per chapter")
+    sp.add_argument("--chapter-timeout", type=int, default=6 * 3600, help="seconds per chapter (Colab)")
+    sp.add_argument("--backend", default="colab", choices=["colab", "kaggle"],
+                    help="colab: live session via the Colab CLI; kaggle: background notebook via the Kaggle API")
+    sp.add_argument("--kaggle-bin", default=None, help="path to the kaggle CLI (default: $KAGGLE_BIN or 'kaggle')")
+    sp.add_argument("--kaggle-user", default=None, help="Kaggle username (default: from ~/.kaggle/kaggle.json)")
+    sp.add_argument("--kaggle-dataset", default="audiobook-jobs", help="private dataset slug for the inputs")
+    sp.add_argument("--kaggle-kernel", default="audiobook-render", help="private notebook slug for the render")
+    sp.add_argument("--kaggle-accelerator", default="NvidiaTeslaT4",
+                    help="NvidiaTeslaT4 (T4 x2) or NvidiaL4; avoid P100, current PyTorch no longer supports it")
+    sp.add_argument("--kaggle-max-hours", type=int, default=11, help="Kaggle caps a run at 12 hours")
+    sp.add_argument("--poll-seconds", type=float, default=60.0, help="how often to check Kaggle status")
     sp.set_defaults(func=cmd_render)
 
     sp = sub.add_parser("assemble", help="rebuild chapter.wav and stems from lines/")

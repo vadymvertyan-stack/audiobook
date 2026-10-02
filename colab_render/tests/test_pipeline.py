@@ -39,7 +39,9 @@ def write_ref(path, seconds=4.0, sr=24000):
         w.writeframes(b"\x01\x00" * int(seconds * sr))
 
 
-class PipelineTest(unittest.TestCase):
+class BookFixture(unittest.TestCase):
+    """A three-voice, two-chapter book with reference clips, and fake CLIs."""
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.state = os.path.join(self.tmp, "state")
@@ -80,6 +82,8 @@ class PipelineTest(unittest.TestCase):
              "--out", self.out, "--engine", "dummy", *extra]
         )
 
+
+class PipelineTest(BookFixture):
     def test_parse_book(self):
         chapters = orchestrate.parse_book(BOOK)
         self.assertEqual([c["title"] for c in chapters], ["Розділ 1. Ліс", "Розділ 2. Ранок"])
@@ -132,7 +136,8 @@ class PipelineTest(unittest.TestCase):
     def test_render_end_to_end(self):
         self.assertEqual(self.render(), 0)
         ch1 = os.path.join(self.out, "01_Розділ_1_Ліс")
-        manifest = json.load(open(os.path.join(ch1, "manifest.json"), encoding="utf-8"))
+        with open(os.path.join(ch1, "manifest.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
         self.assertEqual(len(manifest["lines"]), 4)
         self.assertEqual(manifest["lines"][1]["gap_after_ms"], 1500)
         self.assertEqual(manifest["lines"][2]["gap_after_ms"], 700)  # paragraph
@@ -176,6 +181,71 @@ class PipelineTest(unittest.TestCase):
         report = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual(report["stopped"], ["left-on"])
         self.assertEqual(report["usage"]["active_assignments"], 0.0)
+
+
+class KaggleTest(BookFixture):
+    """Same book and voices, rendered through the fake `kaggle` CLI."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["FAKE_KAGGLE_ROOT"] = os.path.join(self.tmp, "kaggle_state")
+        os.environ.pop("FAKE_KAGGLE_FAIL", None)
+        os.environ["KAGGLE_CONFIG_DIR"] = os.path.join(self.tmp, "no-kaggle-config")
+        kaggle_bin = os.path.join(self.tmp, "kaggle")
+        with open(kaggle_bin, "w") as f:
+            f.write(f"#!/bin/sh\nexec {sys.executable} {os.path.join(HERE, 'fake_kaggle.py')} \"$@\"\n")
+        os.chmod(kaggle_bin, 0o755)
+        self.kaggle_bin = kaggle_bin
+
+    def kaggle_calls(self):
+        with open(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "calls.log")) as f:
+            return [line.strip() for line in f]
+
+    def render_kaggle(self, *extra, user="tester"):
+        args = ["render", self.book, "--voices", self.voices, "--out", self.out, "--engine", "dummy",
+                "--backend", "kaggle", "--kaggle-bin", self.kaggle_bin, "--poll-seconds", "0", *extra]
+        if user:
+            args += ["--kaggle-user", user]
+        return orchestrate.main(args)
+
+    def test_kaggle_end_to_end(self):
+        self.assertEqual(self.render_kaggle(), 0)
+        for name in ("01_Розділ_1_Ліс", "02_Розділ_2_Ранок"):
+            self.assertTrue(os.path.exists(os.path.join(self.out, name, "chapter.wav")))
+        calls = self.kaggle_calls()
+        self.assertIn("datasets create", calls)
+        self.assertEqual(calls.count("kernels push"), 1)  # whole book in one run
+        self.assertEqual(calls[-1], "kernels output")
+        # A second book version updates the same dataset instead of creating a new one.
+        self.assertEqual(self.render_kaggle("--force"), 0)
+        self.assertIn("datasets version", self.kaggle_calls())
+        self.assertFalse(os.path.exists(orchestrate.LOCK_PATH))
+
+    def test_kaggle_keeps_finished_chapters_when_one_fails(self):
+        os.environ["FAKE_KAGGLE_FAIL"] = "chapter2"
+        self.assertEqual(self.render_kaggle(), 1)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "01_Розділ_1_Ліс", "chapter.wav")))
+        self.assertFalse(os.path.exists(os.path.join(self.out, "02_Розділ_2_Ранок")))
+        # Re-run renders only the missing chapter.
+        os.environ.pop("FAKE_KAGGLE_FAIL")
+        os.remove(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "calls.log"))
+        self.assertEqual(self.render_kaggle(), 0)
+        jobs = os.listdir(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "datasets", "tester", "audiobook-jobs"))
+        self.assertEqual(sorted(j for j in jobs if j.startswith("job_")), ["job_002.zip"])
+
+    def test_kaggle_run_error_is_reported(self):
+        os.environ["FAKE_KAGGLE_FAIL"] = "kernel"
+        self.assertEqual(self.render_kaggle(), 1)
+
+    def test_kaggle_needs_a_username(self):
+        self.assertEqual(self.render_kaggle(user=None), 2)
+
+    def test_kaggle_username_from_config(self):
+        cfg = os.environ["KAGGLE_CONFIG_DIR"]
+        os.makedirs(cfg)
+        with open(os.path.join(cfg, "kaggle.json"), "w") as f:
+            json.dump({"username": "fromfile", "key": "x"}, f)
+        self.assertEqual(orchestrate.Kaggle.username(), "fromfile")
 
 
 if __name__ == "__main__":
