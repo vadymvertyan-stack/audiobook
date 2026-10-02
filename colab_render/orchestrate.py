@@ -16,6 +16,7 @@ Commands (all print JSON on the last line, so an agent can parse them):
   render    BOOK --voices V --out DIR render every chapter on a Colab GPU
             ... --backend kaggle          or as one background Kaggle notebook run
   assemble  CHAPTER_DIR               rebuild chapter.wav + stems from lines/
+  import-qwen DIR --out SCRIPT        convert old Audio_Ready_Qwen scene files
   usage                               compute-unit balance and burn rate
   watchdog  [--stop]                  find sessions nobody is using; stop them
 
@@ -467,6 +468,45 @@ def load_book(args: argparse.Namespace):
     return chapters, voices
 
 
+QWEN_SCENE_FILE = re.compile(r"chapter_(\d+)_scene(\d+)\.md$")
+QWEN_TEXT = re.compile(r"^Text:\s*(.*)$", re.M)
+
+
+def convert_qwen_scenes(src_dir: str, voice: str) -> str:
+    """Old Audio_Ready_Qwen exports: one file per scene, blocks of ID / Text /
+    System_Prompt separated by '---'. Each scene becomes one chapter of the
+    script, so a test can render a single scene. System_Prompt is dropped:
+    the cloned voice carries the tone now."""
+    files = []
+    for name in os.listdir(src_dir):
+        m = QWEN_SCENE_FILE.search(name)
+        if m:
+            files.append((int(m.group(1)), int(m.group(2)), name))
+    if not files:
+        raise FileNotFoundError(f"no *chapter_NN_sceneK.md files in {src_dir}")
+    out = []
+    for ch, sc, name in sorted(files):
+        texts = [t.strip() for t in QWEN_TEXT.findall(read_text(os.path.join(src_dir, name)) or "") if t.strip()]
+        if not texts:
+            continue
+        out.append(f"# Глава {ch:02d}, сцена {sc}")
+        out.append(f"[voice:{voice}]")
+        out.extend(texts)
+        out.append("")
+    return "\n".join(out)
+
+
+def cmd_import_qwen(args: argparse.Namespace) -> int:
+    script = convert_qwen_scenes(args.src, args.voice)
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(script)
+    chapters = parse_book(script)
+    emit({"ok": True, "out": args.out, "chapters": len(chapters),
+          "lines": sum(len(c["lines"]) for c in chapters),
+          "chars": sum(len(ln["text"]) for c in chapters for ln in c["lines"])})
+    return 0
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     chapters, voices = load_book(args)
     problems = check_voices(chapters, voices)
@@ -788,6 +828,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("assemble", help="rebuild chapter.wav and stems from lines/")
     sp.add_argument("chapter_dir")
     sp.set_defaults(func=cmd_assemble)
+
+    sp = sub.add_parser("import-qwen", help="convert Audio_Ready_Qwen scene files into a script")
+    sp.add_argument("src", help="folder with *_chapter_NN_sceneK.md files")
+    sp.add_argument("--out", required=True, help="script file to write")
+    sp.add_argument("--voice", default="Диктор", help="voice for every line")
+    sp.set_defaults(func=cmd_import_qwen)
 
     sp = sub.add_parser("usage", help="compute units balance and burn rate")
     sp.set_defaults(func=cmd_usage)

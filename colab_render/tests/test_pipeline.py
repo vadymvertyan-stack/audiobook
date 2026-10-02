@@ -113,6 +113,22 @@ class PipelineTest(BookFixture):
         lex = {"ТзОВ": "тe-зе-о-ве", "Кот": "Кіт"}
         self.assertEqual(render_chapter.apply_lexicon("Кот і Котляревський", lex), "Кіт і Котляревський")
 
+    def test_import_qwen_scenes(self):
+        src = os.path.join(self.tmp, "qwen")
+        os.makedirs(src)
+        for name, body in [
+            ("vol1_chapter_10_scene1.md", "ID: 0001\nText: Десятая.\nSystem_Prompt: x\n"),
+            ("vol1_chapter_02_scene1.md", "ID: 0001\nText: Глава вторая.\nSystem_Prompt: Calm.\n---\n"
+                                          "ID: 0002\nText: — Ты слышишь?\nSystem_Prompt: Tense.\n"),
+            ("notes.md", "Text: ignored"),
+        ]:
+            with open(os.path.join(src, name), "w", encoding="utf-8") as f:
+                f.write(body)
+        chapters = orchestrate.parse_book(orchestrate.convert_qwen_scenes(src, "Диктор"))
+        self.assertEqual([c["title"] for c in chapters], ["Глава 02, сцена 1", "Глава 10, сцена 1"])
+        self.assertEqual([(ln["voice"], ln["text"]) for ln in chapters[0]["lines"]],
+                         [("Диктор", "Глава вторая."), ("Диктор", "— Ты слышишь?")])
+
     def test_plan_reports_missing_voice(self):
         with open(self.voices, encoding="utf-8") as f:
             v = json.load(f)
