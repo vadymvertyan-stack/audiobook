@@ -240,6 +240,14 @@ class KaggleTest(BookFixture):
     def test_kaggle_needs_a_username(self):
         self.assertEqual(self.render_kaggle(user=None), 2)
 
+    def test_kaggle_username_from_cli_login(self):
+        os.environ["FAKE_KAGGLE_USER"] = "oauthuser"
+        try:
+            self.assertEqual(orchestrate.Kaggle.username(None, self.kaggle_bin), "oauthuser")
+        finally:
+            del os.environ["FAKE_KAGGLE_USER"]
+        self.assertIsNone(orchestrate.Kaggle.username(None, self.kaggle_bin))
+
     def test_kaggle_username_from_config(self):
         cfg = os.environ["KAGGLE_CONFIG_DIR"]
         os.makedirs(cfg)

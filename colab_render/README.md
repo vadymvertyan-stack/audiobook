@@ -92,8 +92,8 @@ python3 orchestrate.py watchdog --stop
 
 Один раз на сервері:
 1. Акаунт Kaggle має бути підтверджений номером телефону, інакше GPU та інтернет у ноутбуках недоступні.
-2. Kaggle → Settings → API → Create New Token. Отриманий `kaggle.json` покладіть у `~/.kaggle/kaggle.json` під vadym і виконайте `chmod 600 ~/.kaggle/kaggle.json`.
-3. `uv tool install kaggle` (або `pip install kaggle`), потім перевірка: `kaggle datasets list -m`.
+2. `uv tool install kaggle` (або `pip install kaggle`).
+3. Під vadym: `kaggle auth login --no-launch-browser`. Відкрийте посилання, яке виведе команда, і підтвердіть вхід. Перевірка: `kaggle config view` має показати ваш username.
 
 Рендер:
 ```bash

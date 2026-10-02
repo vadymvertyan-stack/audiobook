@@ -78,8 +78,8 @@ python3 ~/audiobook/colab_render/orchestrate.py render ~/audiobook-data/books/<s
 - Re-running the same command skips chapters that are already done. Use it
   after a failure instead of `--force`.
 - Never pass `--keep` unless the user explicitly wants the VM left running.
-- While `usage` shows 0 compute units, add `--backend kaggle` (needs
-  `~/.kaggle/kaggle.json`). The command then waits until the Kaggle run
+- While `usage` shows 0 compute units, add `--backend kaggle` (needs a
+  `kaggle auth login` done once by the user). The command then waits until the Kaggle run
   finishes, which can take hours; there is no session to stop.
 
 Every chapter folder contains `chapter.mp3` (or `chapter.wav`), `stems/` (one

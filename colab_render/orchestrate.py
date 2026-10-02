@@ -384,7 +384,7 @@ class Kaggle(Cli):
     default = "kaggle"
 
     @staticmethod
-    def username(explicit: Optional[str] = None) -> Optional[str]:
+    def username(explicit: Optional[str] = None, binary: Optional[str] = None) -> Optional[str]:
         if explicit:
             return explicit
         if os.environ.get("KAGGLE_USERNAME"):
@@ -394,7 +394,16 @@ class Kaggle(Cli):
             with open(os.path.join(cfg_dir, "kaggle.json"), encoding="utf-8") as f:
                 return json.load(f).get("username")
         except (OSError, ValueError):
+            pass
+        # `kaggle auth login` (OAuth) and access_token logins leave no kaggle.json;
+        # the CLI still reports the account in `config view` ("- username: NAME").
+        try:
+            res = subprocess.run([binary or os.environ.get("KAGGLE_BIN", "kaggle"), "config", "view"],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
             return None
+        m = re.search(r"username:\s*(\S+)", res.stdout)
+        return m.group(1) if m and m.group(1).lower() != "none" else None
 
     def status_word(self, *args: str) -> str:
         """Last word of `... status`, lowercased: complete, running, ready, error, ..."""
@@ -494,8 +503,8 @@ def finish_chapter(ch: Dict[str, Any], ch_dir: str, out_zip: str, job_id: str, s
 def cmd_render(args: argparse.Namespace) -> int:
     chapters, voices = load_book(args)
     problems = check_voices(chapters, voices)
-    if args.backend == "kaggle" and not Kaggle.username(args.kaggle_user):
-        problems.append("Kaggle username unknown: put kaggle.json in ~/.kaggle or pass --kaggle-user")
+    if args.backend == "kaggle" and not Kaggle.username(args.kaggle_user, args.kaggle_bin):
+        problems.append("Kaggle account unknown: run `kaggle auth login` or pass --kaggle-user")
     if problems:
         emit({"ok": False, "problems": problems})
         return 2
@@ -596,7 +605,7 @@ os.environ.setdefault("AUDIOBOOK_BATCH_OUT", "/kaggle/working")
 
 def _render_kaggle(args: argparse.Namespace, todo: List[tuple]) -> int:
     kaggle = Kaggle(args.kaggle_bin)
-    user = Kaggle.username(args.kaggle_user)
+    user = Kaggle.username(args.kaggle_user, args.kaggle_bin)
     dataset_id = f"{user}/{args.kaggle_dataset}"
     kernel_id = f"{user}/{args.kaggle_kernel}"
     _write_lock(kernel_id, args)
@@ -767,7 +776,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--backend", default="colab", choices=["colab", "kaggle"],
                     help="colab: live session via the Colab CLI; kaggle: background notebook via the Kaggle API")
     sp.add_argument("--kaggle-bin", default=None, help="path to the kaggle CLI (default: $KAGGLE_BIN or 'kaggle')")
-    sp.add_argument("--kaggle-user", default=None, help="Kaggle username (default: from ~/.kaggle/kaggle.json)")
+    sp.add_argument("--kaggle-user", default=None, help="Kaggle username (default: from the kaggle CLI login)")
     sp.add_argument("--kaggle-dataset", default="audiobook-jobs", help="private dataset slug for the inputs")
     sp.add_argument("--kaggle-kernel", default="audiobook-render", help="private notebook slug for the render")
     sp.add_argument("--kaggle-accelerator", default="NvidiaTeslaT4",

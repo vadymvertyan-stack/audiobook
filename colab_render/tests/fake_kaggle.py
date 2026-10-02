@@ -25,6 +25,9 @@ def main():
     with open(os.path.join(ROOT, "calls.log"), "a") as f:
         f.write(" ".join(args[:2]) + "\n")
     group, cmd = args[0], args[1]
+    if group == "config" and cmd == "view":
+        print(f"Configuration values from {ROOT}\n- username: {os.environ.get('FAKE_KAGGLE_USER', 'None')}")
+        return 0
     if group == "datasets":
         if cmd == "status":
             if not os.path.isdir(os.path.join(ROOT, "datasets", args[2])):
