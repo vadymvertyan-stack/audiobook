@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 
 ROOT = os.environ["FAKE_KAGGLE_ROOT"]
 
@@ -30,6 +31,11 @@ def main():
         return 0
     if group == "datasets":
         if cmd == "status":
+            flag = os.path.join(ROOT, "status_403")
+            if os.path.exists(flag):
+                os.remove(flag)
+                print("403 Client Error: Forbidden for url: https://api.kaggle.com/v1/datasets", file=sys.stderr)
+                return 1
             if not os.path.isdir(os.path.join(ROOT, "datasets", args[2])):
                 print("404 Client Error: Not Found", file=sys.stderr)
                 return 1
@@ -44,6 +50,15 @@ def main():
             if os.path.isdir(dst):
                 shutil.rmtree(dst)
             shutil.copytree(src, dst)
+            # Like Kaggle: uploaded zips are unpacked into folders.
+            for name in os.listdir(dst):
+                if name.endswith(".zip"):
+                    with zipfile.ZipFile(os.path.join(dst, name)) as z:
+                        z.extractall(os.path.join(dst, name[:-4]))
+                    os.remove(os.path.join(dst, name))
+            # And a fresh dataset is briefly forbidden.
+            with open(os.path.join(ROOT, "status_403"), "w") as f:
+                f.write("1")
     elif group == "kernels":
         state_path = os.path.join(ROOT, "kernel_state.json")
         if cmd == "push":
@@ -59,9 +74,9 @@ def main():
             for ds in meta["dataset_sources"]:
                 shutil.copytree(os.path.join(ROOT, "datasets", ds), os.path.join(inputs, ds.split("/")[1]))
             if os.environ.get("FAKE_KAGGLE_FAIL") == "chapter2":
-                os.remove(os.path.join(inputs, ds.split("/")[1], "job_002.zip"))
-                with open(os.path.join(inputs, ds.split("/")[1], "job_002.zip"), "w") as f:
-                    f.write("not a zip")
+                os.remove(os.path.join(inputs, ds.split("/")[1], "job_002", "job.json"))
+                with open(os.path.join(inputs, ds.split("/")[1], "job_002", "job.json"), "w") as f:
+                    f.write("not json")
             env = dict(os.environ)
             env["AUDIOBOOK_BATCH_GLOB"] = os.path.join(inputs, "**", "job_*.zip")
             env["AUDIOBOOK_BATCH_OUT"] = working

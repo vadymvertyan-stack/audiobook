@@ -247,7 +247,7 @@ class KaggleTest(BookFixture):
         os.remove(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "calls.log"))
         self.assertEqual(self.render_kaggle(), 0)
         jobs = os.listdir(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "datasets", "tester", "audiobook-jobs"))
-        self.assertEqual(sorted(j for j in jobs if j.startswith("job_")), ["job_002.zip"])
+        self.assertEqual(sorted(j for j in jobs if j.startswith("job_")), ["job_002"])
 
     def test_kaggle_run_error_is_reported(self):
         os.environ["FAKE_KAGGLE_FAIL"] = "kernel"

@@ -412,10 +412,17 @@ class Kaggle(Cli):
         m = re.findall(r"[a-z_]+", out.splitlines()[0] if out else "")
         return m[-1] if m else out
 
-    def wait(self, args: List[str], done: set, failed: set, poll: float, max_seconds: float) -> str:
+    def wait(self, args: List[str], done: set, failed: set, poll: float, max_seconds: float,
+             retry_errors: bool = False) -> str:
         deadline = time.time() + max_seconds
         while True:
-            word = self.status_word(*args)
+            try:
+                word = self.status_word(*args)
+            except ColabError as e:
+                # A just-created dataset answers 403/404 for a little while.
+                if not retry_errors or time.time() > deadline:
+                    raise
+                word = f"error: {e}"
             if word in done or word in failed:
                 return word
             if time.time() > deadline:
@@ -676,7 +683,7 @@ def _render_kaggle(args: argparse.Namespace, todo: List[tuple]) -> int:
         if not created_ds:
             kaggle.run("datasets", "create", "-p", ds_dir, "-q", timeout=1800)
         kaggle.wait(["datasets", "status", dataset_id], {"ready"}, {"failed", "deleted"},
-                    args.poll_seconds, 30 * 60)
+                    min(args.poll_seconds, 15.0), 30 * 60, retry_errors=True)
 
         # 2. The render: a private script notebook with GPU and internet (for pip + model download).
         k_dir = os.path.join(work, "kernel")
