@@ -43,6 +43,7 @@ import builtins
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -245,6 +246,30 @@ class DummyEngine:
         return (tone + 0.005 * rng.standard_normal(t.size)).astype(np.float32)
 
 
+def _words(text: str) -> List[str]:
+    text = unicodedata.normalize("NFD", text.lower().replace("ё", "е"))
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return re.findall(r"\w+", text)
+
+
+def reference_mismatch(ref_text: str, heard: str) -> Optional[str]:
+    """None when the transcript of the reference matches ref_text closely
+    enough, otherwise a short reason. The first and last words matter most:
+    an extra or missing word at an edge leaks into every generated line."""
+    import difflib
+
+    want, got = _words(ref_text), _words(heard)
+    if not want or not got:
+        return "empty text or transcript"
+    for edge, w, g in (("first", want[0], got[0]), ("last", want[-1], got[-1])):
+        if difflib.SequenceMatcher(None, w, g).ratio() < 0.6:
+            return f"{edge} word differs: text '{w}', audio '{g}'"
+    ratio = difflib.SequenceMatcher(None, want, got).ratio()
+    if ratio < 0.8:
+        return f"only {ratio:.0%} of the words match"
+    return None
+
+
 class OmniVoiceEngine:
     """k2-fsa/OmniVoice: non-autoregressive, deterministic token choice by default."""
 
@@ -264,9 +289,26 @@ class OmniVoiceEngine:
         log(f"loading {model_id} on {device}")
         self.model = OmniVoice.from_pretrained(model_id, device_map=device, dtype=dtype)
         self.options = dict(options or {})
+        self.check_ref = bool(self.options.pop("check_ref", True))
 
     def prepare_voice(self, voice_name: str, voice: Dict[str, Any]) -> Any:
+        if self.check_ref:
+            self._check_reference(voice_name, voice)
         return self.model.create_voice_clone_prompt(ref_audio=voice["ref_audio"], ref_text=voice["ref_text"])
+
+    def _check_reference(self, voice_name: str, voice: Dict[str, Any]) -> None:
+        """Whisper the reference and compare it with ref_text. A word that is in
+        the text but not in the audio gets spoken at the start of every line."""
+        if getattr(self.model, "_asr_pipe", None) is None:
+            self.model.load_asr_model()
+        heard = self.model.transcribe(voice["ref_audio"])
+        problem = reference_mismatch(voice["ref_text"], heard)
+        log(f"reference '{voice_name}': whisper heard: {heard}")
+        if problem:
+            raise SystemExit(
+                f"reference for '{voice_name}' does not match its ref_text ({problem}). "
+                f"Whisper heard: \"{heard}\". Fix ref_text or re-cut the wav; "
+                'pass --engine-options \'{"check_ref": false}\' to skip this check.')
 
     def synth(self, text: str, prompt: Any, voice: Dict[str, Any], language: str, speed: float, seed: int) -> np.ndarray:
         _seed_everything(seed)

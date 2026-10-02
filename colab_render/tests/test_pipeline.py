@@ -249,6 +249,16 @@ class KaggleTest(BookFixture):
         jobs = os.listdir(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "datasets", "tester", "audiobook-jobs"))
         self.assertEqual(sorted(j for j in jobs if j.startswith("job_")), ["job_002"])
 
+    def test_reference_mismatch(self):
+        text = "Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопье́сы."
+        self.assertIsNone(render_chapter.reference_mismatch(
+            text, " Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопьесы."))
+        # The real failure: the cut lost the last word.
+        self.assertIn("last word", render_chapter.reference_mismatch(
+            text, "Мой голос мужской, уверенный и ровный, Добро пожаловать в мир."))
+        self.assertIn("first word", render_chapter.reference_mismatch(
+            "Привет. " + text, text))
+
     def test_render_stops_early_without_internet(self):
         import socket
         real = socket.getaddrinfo
