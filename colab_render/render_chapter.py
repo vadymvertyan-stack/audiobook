@@ -196,7 +196,19 @@ def apply_lexicon(text: str, lexicon: Dict[str, str]) -> str:
 # Engines
 # ---------------------------------------------------------------------------
 
+class NoInternet(RuntimeError):
+    pass
+
+
 def _pip_install(*packages: str) -> None:
+    import socket
+
+    try:
+        socket.getaddrinfo("pypi.org", 443)
+    except OSError as e:
+        raise NoInternet(
+            f"no internet on this machine ({e}); on Kaggle, verify your phone number "
+            "at kaggle.com/settings, otherwise notebooks run offline") from e
     log(f"pip install {' '.join(packages)}")
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", *packages], check=True)
 
@@ -535,6 +547,9 @@ def run_batch(pattern: str, out_root: str, workdir: str, engine_override: Option
         report.append(entry)
         with open(os.path.join(out_root, "batch_report.json"), "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
+        if entry.get("error", "").startswith("NoInternet"):
+            log("no internet: skipping the remaining jobs")
+            break
     return report
 
 

@@ -715,12 +715,16 @@ def _render_kaggle(args: argparse.Namespace, todo: List[tuple]) -> int:
         except (OSError, ValueError):
             report = {}
         failures = []
+        # A run that stopped early (e.g. no internet) leaves later jobs without
+        # an entry; give them the same reason instead of "no output".
+        fatal = next((r["error"] for r in report.values()
+                      if str(r.get("error", "")).startswith("NoInternet")), None)
         for ch, ch_dir, _, job_id in todo:
             name = f"job_{ch['index']:03d}.zip"
             entry = report.get(name)
             out_zip = os.path.join(out_dir, f"out_{ch['index']:03d}.zip")
             if not entry or not entry.get("ok") or not os.path.exists(out_zip):
-                failures.append({"index": ch["index"], "error": (entry or {}).get("error", "no output")})
+                failures.append({"index": ch["index"], "error": (entry or {}).get("error", fatal or "no output")})
             elif entry.get("job_id") != job_id:
                 # The notebook saw an older dataset version.
                 failures.append({"index": ch["index"], "error": "stale input on Kaggle, run again"})

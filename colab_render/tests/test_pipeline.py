@@ -249,6 +249,16 @@ class KaggleTest(BookFixture):
         jobs = os.listdir(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "datasets", "tester", "audiobook-jobs"))
         self.assertEqual(sorted(j for j in jobs if j.startswith("job_")), ["job_002"])
 
+    def test_render_stops_early_without_internet(self):
+        import socket
+        real = socket.getaddrinfo
+        socket.getaddrinfo = lambda *a, **k: (_ for _ in ()).throw(socket.gaierror(-3, "Temporary failure"))
+        try:
+            with self.assertRaises(render_chapter.NoInternet):
+                render_chapter._pip_install("omnivoice")
+        finally:
+            socket.getaddrinfo = real
+
     def test_kaggle_run_error_is_reported(self):
         os.environ["FAKE_KAGGLE_FAIL"] = "kernel"
         self.assertEqual(self.render_kaggle(), 1)
