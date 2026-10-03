@@ -57,8 +57,11 @@ CLI працює тільки на Linux/macOS, на Windows його немає
 Старі файли з `Audio_Ready_Qwen` (`ID / Text / System_Prompt`) перетворюються на цю розмітку однією командою. Кожна сцена стає окремою главою, усі репліки йдуть голосу `--voice`:
 
 ```bash
-python3 orchestrate.py import-qwen ~/audiobook-data/books/echo/src/Audio_Ready_Qwen --out script.txt --voice Диктор
+python3 orchestrate.py import-qwen ~/audiobook-data/books/echo/src/Audio_Ready_Qwen --out script.txt --voice Диктор \
+    --prose ~/audiobook-data/books/echo/src/Том_1
 ```
+
+З `--prose` (тека з оригінальним текстом під тими самими іменами файлів) паузи беруться з книги: якщо два рядки — це одне речення, розрізане навпіл, пауза коротка; між абзацами довга; на вході в пряму мову героя і на виході з неї — пауза діалогу. Без `--prose` паузи вгадуються лише за розділовими знаками.
 
 `System_Prompt` при цьому перетворюється на теги `[speed 0.9]` (slow / fast / urgent) і `[volume 0.55]` (whisper / quiet). Емоцію OmniVoice бере лише з еталона, тож текстові вказівки змінюють тільки темп і гучність.
 

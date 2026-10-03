@@ -45,10 +45,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import time
 import wave
 import zipfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RENDER_SCRIPT = os.path.join(HERE, "render_chapter.py")
@@ -590,7 +591,95 @@ def qwen_delivery(prompt: str) -> str:
     return " ".join(tags)
 
 
-def convert_qwen_scenes(src_dir: str, voice: str) -> str:
+def _letters(text: str) -> Tuple[str, List[int]]:
+    """Lowercase letters only (no stress marks, ё as е) and, for each, its
+    index in `text`. Spacing, punctuation and digits differ between the
+    prose and the TTS lines; the letters mostly do not."""
+    out, idx = [], []
+    for i, c in enumerate(text):
+        for d in unicodedata.normalize("NFD", c.lower()):
+            if d.isalpha():
+                out.append("е" if d == "ё" else d)
+                idx.append(i)
+    return "".join(out), idx
+
+
+def _speech_mask(prose: str) -> List[bool]:
+    """Per character: inside a character's direct speech? A paragraph that
+    opens with a dash alternates speech / author's words at each ' — '."""
+    mask = [False] * len(prose)
+    for m in re.finditer(r"[^\n]+", prose):
+        para = m.group(0)
+        if not para.lstrip().startswith(("—", "–")):
+            continue
+        speech = True
+        start = base = m.start() + len(para) - len(para.lstrip()) + 1
+        for d in re.finditer(r"\s[—–]\s", para[base - m.start():]):
+            cut = base + d.start()
+            for k in range(start, cut):
+                mask[k] = speech
+            speech = not speech
+            start = cut + 1
+        for k in range(start, m.end()):
+            mask[k] = speech
+    return mask
+
+
+def prose_pauses(lines: List[str], prose: str, gaps: Optional[Dict[str, int]] = None) -> List[Optional[int]]:
+    """Pause after each TTS line, read from the original prose the lines were
+    cut from: same sentence -> short, sentence end -> by its punctuation,
+    paragraph -> long, into or out of direct speech -> dialogue. None where a
+    line could not be found in the prose."""
+    g = dict(GAPS_MS, **(gaps or {}))
+    letters, where = _letters(prose)
+    mask = _speech_mask(prose)
+    spans: List[Optional[Tuple[int, int]]] = []
+    pos = 0
+    for line in lines:
+        key, _ = _letters(line)
+        if len(key) < 4:
+            spans.append(None)
+            continue
+        window = letters[pos:pos + max(4000, 3 * len(key))]
+        head = window.find(key[:16])
+        if head < 0:
+            mid = len(key) // 2
+            hit = window.find(key[mid:mid + 12])
+            head = hit - mid if hit >= 0 else -1
+        if head < 0:
+            spans.append(None)
+            continue
+        start = pos + max(head, 0)
+        tail_key = key[-12:]
+        tail = letters.find(tail_key, start + max(0, len(key) - len(tail_key) - 40), start + len(key) + 60)
+        end = tail + len(tail_key) - 1 if tail >= 0 else min(start + len(key) - 1, len(letters) - 1)
+        spans.append((where[start], where[end]))
+        pos = end + 1
+    pauses: List[Optional[int]] = []
+    for i, span in enumerate(spans):
+        nxt = spans[i + 1] if i + 1 < len(spans) else None
+        if span is None or nxt is None or nxt[0] <= span[1]:
+            pauses.append(None if i + 1 < len(spans) else 0)
+            continue
+        between = prose[span[1] + 1:nxt[0]]
+        tail = prose[max(span[0], span[1] - 3):span[1] + 1] + between
+        if "\n" in between:
+            gap = g["paragraph"]
+        elif mask[span[1]] != mask[nxt[0]]:
+            gap = g["dialogue"]
+        elif not re.search(r"[.!?…]", between):
+            gap = g["continue"]
+        elif "…" in between or "..." in tail:
+            gap = g["ellipsis"]
+        elif re.search(r"[!?]", between):
+            gap = g["question"]
+        else:
+            gap = g["line"]
+        pauses.append(gap)
+    return pauses
+
+
+def convert_qwen_scenes(src_dir: str, voice: str, prose_dir: Optional[str] = None) -> str:
     """Old Audio_Ready_Qwen exports: one file per scene, blocks of ID / Text /
     System_Prompt separated by '---'. Each scene becomes one chapter of the
     script, so a test can render a single scene. System_Prompt becomes
@@ -608,17 +697,22 @@ def convert_qwen_scenes(src_dir: str, voice: str) -> str:
                   if t.strip()]
         if not blocks:
             continue
+        pauses: List[Optional[int]] = [None] * len(blocks)
+        prose = read_text(os.path.join(prose_dir, name)) if prose_dir else None
+        if prose:
+            pauses = prose_pauses([t for t, _ in blocks], prose)
         out.append(f"# Глава {ch:02d}, сцена {sc}")
         out.append(f"[voice:{voice}]")
-        for text, prompt in blocks:
+        for (text, prompt), pause in zip(blocks, pauses):
             tags = qwen_delivery(prompt)
-            out.append(f"{tags} {text}" if tags else text)
+            line = f"{tags} {text}" if tags else text
+            out.append(line if pause is None else f"{line} [pause {pause}ms]")
         out.append("")
     return "\n".join(out)
 
 
 def cmd_import_qwen(args: argparse.Namespace) -> int:
-    script = convert_qwen_scenes(args.src, args.voice)
+    script = convert_qwen_scenes(args.src, args.voice, args.prose)
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(script)
     chapters = parse_book(script)
@@ -972,6 +1066,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("src", help="folder with *_chapter_NN_sceneK.md files")
     sp.add_argument("--out", required=True, help="script file to write")
     sp.add_argument("--voice", default="Диктор", help="voice for every line")
+    sp.add_argument("--prose", default=None,
+                    help="folder with the original prose under the same file names; pauses follow its "
+                         "sentences, paragraphs and dialogue")
     sp.set_defaults(func=cmd_import_qwen)
 
     sp = sub.add_parser("usage", help="compute units balance and burn rate")
