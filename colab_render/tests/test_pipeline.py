@@ -338,7 +338,20 @@ class KaggleTest(BookFixture):
         self.assertTrue(texts[0].startswith("Пятьдесят третий") and texts[0].endswith("огнем!"))
         self.assertTrue(texts[2].startswith("Они нас здесь похоронят"))
         cast = {"Андрей": ["Скиф"], "Лис": []}
-        self.assertEqual(orchestrate.guess_speakers(self.PROSE, cast), ["Андрей", None, None, None])
+        # 1: verb + name; 2: same paragraph; 3: "прошептал он" -> last man named; 4: same paragraph
+        self.assertEqual(orchestrate.guess_speakers(self.PROSE, cast), ["Андрей"] * 4)
+        with_lis = self.PROSE.replace("Эфир ответил", "Лис дрожал. Эфир ответил")
+        self.assertEqual(orchestrate.guess_speakers(with_lis, cast), ["Андрей", "Андрей", "Лис", "Лис"])
+
+    def test_guess_speakers_women_and_turn_taking(self):
+        prose = ("Милонега склонилась над ним.\n\n"
+                 "— Лежи. Не рвись, — тихо сказала женщина.\n\n"
+                 "— Где я? — прохрипел Андрей.\n\n"
+                 "— В моей избе.\n\n"
+                 "— Кто ты?\n")
+        cast = {"Андрей": [], "Милонега": [], "Лис": []}
+        got = orchestrate.guess_speakers(prose, cast, {"Милонега": "f"})
+        self.assertEqual(got, ["Милонега", "Андрей", "Милонега", "Андрей"])
 
     def test_attribute_asks_the_llm_and_keeps_name_guesses(self):
         import http.server

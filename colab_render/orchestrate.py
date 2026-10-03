@@ -810,21 +810,81 @@ def _name_forms(cast: Dict[str, List[str]]) -> List[Tuple[re.Pattern, str]]:
     return out
 
 
-def guess_speakers(prose: str, cast: Dict[str, List[str]]) -> List[Optional[str]]:
-    """Without an LLM: a speaking verb right after the speech followed by a
-    cast name ("— К бою! — заорал Андрей"). Pronouns stay unknown."""
+_PRONOUN = re.compile(r"(?i)^(он|она|парень|мужчина|старик|воин|женщина|девушка|старуха|знахарка|целительница|"
+                      r"травница|хозяйка)\b")
+_FEMALE_WORDS = {"она", "женщина", "девушка", "старуха", "знахарка", "целительница", "травница", "хозяйка"}
+
+
+def guess_speakers(prose: str, cast: Dict[str, List[str]],
+                   genders: Optional[Dict[str, str]] = None) -> List[Optional[str]]:
+    """Without an LLM, in this order:
+    1. a speaking verb after the speech, then a cast name ("— заорал Андрей");
+    2. the verb, then "он"/"она"/"женщина"...: the character of that gender
+       named most recently before the speech;
+    3. the rest of a paragraph goes to whoever spoke in it already;
+    4. two characters taking turns: A, B, ? -> A.
+    Whatever is still unknown stays with the narrator."""
     names = _name_forms(cast)
-    out: List[Optional[str]] = []
-    for a, b in speech_runs(prose):
+    genders = genders or {}
+    runs = speech_runs(prose)
+    out: List[Optional[str]] = [None] * len(runs)
+
+    def mentions(upto: int) -> List[Tuple[int, str]]:
+        found = []
+        text = prose[:upto]
+        for rx, name in names:
+            for m in rx.finditer(text):
+                found.append((m.start(), name))
+        return sorted(found)
+
+    for i, (a, b) in enumerate(runs):
         after = prose[b + 1:b + 80].split("\n")[0]
-        found = None
-        if SPEECH_VERB.search(prose[max(0, b - 2):b + 1] + after):
-            words = re.match(r"[\s,!?.…»\"—–-]*((?:\w+[\s,]+){0,4}\w+)", after)
-            for rx, name in names:
-                if words and rx.search(words.group(1)):
-                    found = name
-                    break
-        out.append(found)
+        if not SPEECH_VERB.search(prose[max(0, b - 2):b + 1] + after):
+            continue
+        tail = re.sub(r"^[\s,!?.…»\"—–-]*", "", after)
+        verb_and_more = re.match(r"(\w+)[\s,]+(.*)", tail)
+        words = re.match(r"((?:\w+[\s,]+){0,4}\w+)", tail)
+        for rx, name in names:
+            if words and rx.search(words.group(1)):
+                out[i] = name
+                break
+        if out[i] or not verb_and_more:
+            continue
+        rest = verb_and_more.group(2)
+        pron = _PRONOUN.match(rest) or _PRONOUN.match(re.sub(r"^\w+\s+", "", rest, count=1))  # "тихо сказала она"
+        if not pron:
+            continue
+        want = "f" if pron.group(1).lower() in _FEMALE_WORDS else "m"
+        para_start = prose.rfind("\n", 0, a) + 1
+        for _, name in reversed(mentions(para_start)):
+            if genders.get(name, "m") == want:
+                out[i] = name
+                break
+
+    line_of = [prose.count("\n", 0, a) for a, _ in runs]
+    for _ in range(2):
+        for i in range(len(runs)):
+            if out[i]:
+                continue
+            same = [out[j] for j in range(len(runs)) if line_of[j] == line_of[i] and out[j]]
+            if same:
+                out[i] = same[0]
+    for i in range(2, len(runs)):
+        if not out[i] and out[i - 1] and out[i - 2] and out[i - 1] != out[i - 2]:
+            out[i] = out[i - 2]
+    return out
+
+
+def cast_genders(path: str) -> Dict[str, str]:
+    """'f' or 'm' per character: an explicit "gender", else read from the description."""
+    with open(path, encoding="utf-8") as f:
+        spec = json.load(f)
+    out = {}
+    for n, c in spec["characters"].items():
+        g = (c.get("gender") or "").lower()[:1]
+        if g not in ("f", "m"):
+            g = "f" if re.search(r"(?i)\b(female|woman|girl|lady)\b", c.get("description", "")) else "m"
+        out[n] = g
     return out
 
 
@@ -870,6 +930,7 @@ def load_cast_names(path: str) -> Dict[str, List[str]]:
 
 def cmd_attribute(args: argparse.Namespace) -> int:
     cast = load_cast_names(args.cast)
+    genders = cast_genders(args.cast)
     key = os.environ.get(args.llm_key_env) if args.llm_key_env else None
     result: Dict[str, Any] = {}
     if os.path.exists(args.out):
@@ -882,7 +943,7 @@ def cmd_attribute(args: argparse.Namespace) -> int:
     for name in names:
         prose = read_text(os.path.join(args.prose, name)) or ""
         runs = speech_runs(prose)
-        guessed = guess_speakers(prose, cast)
+        guessed = guess_speakers(prose, cast, genders)
         asked: List[Optional[str]] = [None] * len(runs)
         if args.llm_url and runs:
             try:

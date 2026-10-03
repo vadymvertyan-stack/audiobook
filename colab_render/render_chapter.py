@@ -581,10 +581,18 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(a @ b) / den if den else 0.0
 
 
+def _clean_pool(takes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Takes Whisper heard nearly word for word, else ones that pass the
+    reference check, else all. A slurred word that passes here can still fail
+    the stricter check in the render."""
+    return ([t for t in takes if t["ok"] and t.get("match", 1.0) >= 0.95]
+            or [t for t in takes if t["ok"]] or takes)
+
+
 def pick_typical(takes: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """The take closest on average to the other takes (ones that pass Whisper
-    first): an outlier timbre loses even if it came out first."""
-    pool = [t for t in takes if t["ok"]] or takes
+    """The take closest on average to the other takes (clean ones first): an
+    outlier timbre loses even if it came out first."""
+    pool = _clean_pool(takes)
     if len(pool) == 1:
         return pool[0]
     best, best_score = pool[0], -2.0
@@ -599,8 +607,7 @@ def pick_typical(takes: List[Dict[str, Any]]) -> Dict[str, Any]:
 def pick_closest(takes: List[Dict[str, Any]], timbre: np.ndarray) -> Dict[str, Any]:
     for t in takes:
         t["similarity"] = round(cosine(t["emb"], timbre), 4)
-    pool = [t for t in takes if t["ok"]] or takes
-    return max(pool, key=lambda t: t["similarity"])
+    return max(_clean_pool(takes), key=lambda t: t["similarity"])
 
 
 class DummyDesigner:
@@ -698,8 +705,11 @@ def cast_voices(job_dir: str, out_dir: str) -> Dict[str, Any]:
             audio = audio * (0.9 / peak)
         heard = designer.transcribe(audio, language)
         problem = reference_mismatch(text, heard)
+        import difflib
+
+        match = round(difflib.SequenceMatcher(None, _words(text), _words(heard)).ratio(), 3)
         write_wav(path, audio, sr)
-        return {"file": os.path.relpath(path, out_dir), "seed": seed, "heard": heard,
+        return {"file": os.path.relpath(path, out_dir), "seed": seed, "heard": heard, "match": match,
                 "ok": problem is None, "problem": problem, "seconds": round(audio.size / sr, 2),
                 "emb": designer.embed(audio)}
 
