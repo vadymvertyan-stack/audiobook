@@ -742,8 +742,11 @@ class SeedVC:
         if not os.path.isdir(os.path.join(self.repo, ".git")):
             log("cloning Seed-VC")
             subprocess.run(["git", "clone", "--depth", "1", self.REPO, self.repo], check=True)
-        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", os.path.join(self.repo, ".venv")],
-                       check=True)
+        # Kaggle's python has no ensurepip, so no pip inside the venv; with
+        # --system-site-packages the system pip still runs there and installs
+        # into the venv.
+        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", "--without-pip",
+                        os.path.join(self.repo, ".venv")], check=True)
         with open(os.path.join(self.repo, "requirements.txt"), encoding="utf-8") as f:
             reqs = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#") and not self.SKIP.search(ln)]
         req = os.path.join(self.repo, "req-kaggle.txt")
