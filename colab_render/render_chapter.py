@@ -340,6 +340,10 @@ class OmniVoiceEngine:
         # the estimate (6% of it, 0.15-0.4 s), and the trim removes what is left.
         self.headroom = float(self.options.pop("headroom", 1.0))
         self.tail = float(self.options.pop("tail", 0.06))
+        self.tail_max = float(self.options.pop("tail_max", 0.4))
+        # Text appended for synthesis only (e.g. " …"), to try letting the
+        # model finish the last word instead of stopping inside it.
+        self.end_suffix = str(self.options.pop("end_suffix", ""))
 
     def prepare_voice(self, voice_name: str, voice: Dict[str, Any]) -> Any:
         if self.check_ref:
@@ -366,6 +370,8 @@ class OmniVoiceEngine:
         if language:
             kwargs["language"] = language
         speed = speed / self.headroom
+        if self.end_suffix:
+            text = text.rstrip() + self.end_suffix
         duration = self._duration_with_tail(text, prompt, speed)
         if duration:
             kwargs["duration"] = duration
@@ -386,7 +392,7 @@ class OmniVoiceEngine:
             log(f"duration estimate unavailable ({e}); using speed only")
             self.tail = 0.0
             return None
-        return seconds + min(0.4, max(0.15, seconds * self.tail))
+        return seconds + min(getattr(self, "tail_max", 0.4), max(0.15, seconds * self.tail))
 
 
 class VoxCPM2Engine:
@@ -546,11 +552,21 @@ def level_emotion_lines(manifest_lines: List[Dict[str, Any]], lines_dir: str, sr
             continue
         path = os.path.join(lines_dir, f"{m['id']}.wav")
         audio, _ = read_wav(path)
-        audio = audio * (10 ** (gain_db / 20))
-        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-        if peak > 0.99:
-            audio = audio * (0.99 / peak)
-        write_wav(path, audio, sr)
+        # Not a whole-line rescale on clipping: a shout has big peaks, and
+        # scaling it back down undid the gain ("К бою!" stayed quiet).
+        write_wav(path, soft_limit(audio * (10 ** (gain_db / 20))), sr)
+
+
+def soft_limit(audio: np.ndarray, knee: float = 0.6, ceiling: float = 0.98) -> np.ndarray:
+    """Leave everything under the knee alone and bend peaks smoothly under the ceiling."""
+    a = np.abs(audio)
+    over = a > knee
+    if not over.any():
+        return audio
+    out = audio.astype(np.float32).copy()
+    room = ceiling - knee
+    out[over] = np.sign(audio[over]) * (knee + room * np.tanh((a[over] - knee) / room))
+    return out
 
 
 def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None) -> Dict[str, Any]:
@@ -655,6 +671,8 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
                 "paragraph_end": bool(ln.get("paragraph_end")),
                 "pause_after_ms": ln.get("pause_after_ms"),
                 "reused": reused,
+                "pieces": len(split_for_synthesis(text, max_chars)),
+                "vc": bool(vc is not None and ":" in ln["voice"] and ln["voice"].split(":")[0] in voices),
             }
         )
         elapsed = time.time() - started

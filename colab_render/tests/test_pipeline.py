@@ -577,6 +577,15 @@ class KaggleTest(BookFixture):
         self.assertAlmostEqual(db["1"] - db["0"], 1.0, delta=0.4)   # tense: calm + 1 dB
         self.assertAlmostEqual(db["2"] - db["0"], 4.0, delta=0.4)   # shout of a voice with no calm line
 
+    def test_soft_limit_keeps_the_gain(self):
+        import numpy as np
+        x = np.sin(np.linspace(0, 60, 24000)).astype(np.float32) * 1.6
+        y = render_chapter.soft_limit(x)
+        self.assertLessEqual(float(np.max(np.abs(y))), 0.98)
+        quiet = np.abs(x) < 0.6
+        self.assertTrue(np.allclose(x[quiet], y[quiet]))
+        self.assertGreater(float(np.sqrt(np.mean(y ** 2))), 0.6)  # not scaled down as a whole
+
     def test_vc_lines_ships_calm_voice(self):
         script = "# Глава\n[voice:Диктор] [emotion tense] [speed 1.15] Тихо.\n"
         chapters = orchestrate.parse_book(script)
