@@ -602,6 +602,11 @@ class KaggleTest(BookFixture):
         self.assertEqual(sorted(job["voices"]), ["Диктор", "Диктор:tense"])
         self.assertEqual(job["vc_lines"], "dummy")
 
+    def test_lexicon_key_ending_in_hyphen(self):
+        lx = {"АК-": "а-ка́ ", "АК": "а-ка́"}
+        self.assertEqual(render_chapter.apply_lexicon("из АК-семьдесят и АК.", lx), "из а-ка́ семьдесят и а-ка́.")
+        self.assertEqual(render_chapter.apply_lexicon("ПАК-семь", lx), "ПАК-семь")
+
     def test_pick_closest_prefers_clean_takes(self):
         import numpy as np
         timbre = np.array([1.0, 0.0])

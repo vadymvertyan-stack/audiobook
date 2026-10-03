@@ -213,7 +213,9 @@ def apply_lexicon(text: str, lexicon: Dict[str, str]) -> str:
     keys = sorted((k for k in lexicon if k.strip()), key=len, reverse=True)
     if not keys:
         return text
-    pattern = re.compile(r"(?<!\w)(" + "|".join(re.escape(k) for k in keys) + r")(?!\w)", re.IGNORECASE)
+    # "АК-" (a key ending in a non-letter) must still match before "семьдесят".
+    pattern = re.compile(r"(?<!\w)(" + "|".join(re.escape(k) + (r"(?!\w)" if re.match(r"\w", k[-1]) else "")
+                                                 for k in keys) + r")", re.IGNORECASE)
     lowered = {k.lower(): v for k, v in lexicon.items()}
 
     def repl(m: "re.Match[str]") -> str:
