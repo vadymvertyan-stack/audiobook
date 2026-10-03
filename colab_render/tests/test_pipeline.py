@@ -549,6 +549,50 @@ class KaggleTest(BookFixture):
         with open(path, encoding="utf-8") as f:
             self.assertEqual(sorted(json.load(f)), ["Милонега", "Милонега:sad"])
 
+    def test_long_lines_are_split_at_pauses(self):
+        text = ("Командный пункт затих, и только где-то далеко, за рекой, глухо ухала арта; ветер нёс над окопами "
+                "едкий дым — горький, тяжёлый, бесконечный, и Андрей, прижавшись к брустверу, смотрел, как над "
+                "лесом медленно поднимается серое, мутное утро.")
+        pieces = render_chapter.split_for_synthesis(text, 170)
+        self.assertEqual(len(pieces), 2)
+        self.assertTrue(pieces[0].endswith("дым"))
+        self.assertEqual(" ".join(pieces), text)
+        self.assertEqual(render_chapter.split_for_synthesis("Коротко.", 170), ["Коротко."])
+
+    def test_emotion_lines_levelled_to_calm(self):
+        import numpy as np
+        sr = 24000
+        d = os.path.join(self.tmp, "lvl")
+        os.makedirs(d)
+        t = np.arange(sr) / sr
+        tone = np.sin(2 * np.pi * 220 * t).astype(np.float32)
+        lines = []
+        for i, (voice, amp) in enumerate([("Диктор", 0.1), ("Диктор:tense", 0.3), ("Андрей:shout", 0.05)]):
+            render_chapter.write_wav(os.path.join(d, f"{i}.wav"), tone * amp, sr)
+            lines.append({"id": str(i), "voice": voice})
+        for _ in range(2):  # idempotent
+            render_chapter.level_emotion_lines(lines, d, sr)
+        db = {m["id"]: render_chapter.active_rms_db(render_chapter.read_wav(os.path.join(d, f"{m['id']}.wav"))[0], sr)
+              for m in lines}
+        self.assertAlmostEqual(db["1"] - db["0"], 1.0, delta=0.4)   # tense: calm + 1 dB
+        self.assertAlmostEqual(db["2"] - db["0"], 4.0, delta=0.4)   # shout of a voice with no calm line
+
+    def test_vc_lines_ships_calm_voice(self):
+        script = "# Глава\n[voice:Диктор] [emotion tense] [speed 1.15] Тихо.\n"
+        chapters = orchestrate.parse_book(script)
+        voices = orchestrate.load_voices(self.voices)
+        voices["Диктор:tense"] = dict(voices["Диктор"])
+        orchestrate.resolve_emotions(chapters, voices)
+        self.assertNotIn("speed", chapters[0]["lines"][0])  # no stacked tempo
+        z = os.path.join(self.tmp, "job.zip")
+        settings = {"engine": "dummy", "language": "ru", "stress": "strip", "vc_lines": "dummy"}
+        orchestrate.build_job(chapters[0], voices, settings, z)
+        import zipfile
+        with zipfile.ZipFile(z) as f:
+            job = json.loads(f.read("job.json"))
+        self.assertEqual(sorted(job["voices"]), ["Диктор", "Диктор:tense"])
+        self.assertEqual(job["vc_lines"], "dummy")
+
     def test_pick_closest_prefers_clean_takes(self):
         import numpy as np
         timbre = np.array([1.0, 0.0])

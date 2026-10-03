@@ -463,6 +463,96 @@ def line_cache_key(engine: str, language: str, voice: Dict[str, Any], text: str,
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+# OmniVoice budgets a line's length from the text and stops when time runs
+# out; on 13-17 s narrator lines the estimate falls short and the last word is
+# cut. Such lines are synthesised in clause-sized pieces and joined.
+MAX_SYNTH_CHARS = 170
+PIECE_GAP_MS = 120
+
+
+def split_for_synthesis(text: str, max_chars: int = MAX_SYNTH_CHARS) -> List[str]:
+    """Cut a long line into about equal pieces at the strongest nearby pause:
+    a sentence end, then ; : or a dash, then a comma."""
+    import math
+    import re
+
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text]
+    cands = []  # (position after the space, strength)
+    for m in re.finditer(r"([.!?…]+)\s+|([;:])\s+|\s+(?=[—–]\s)|(,)\s+", text):
+        strength = 3 if m.group(1) else 1 if m.group(3) else 2
+        cands.append((m.end() if m.group(0).strip() else m.start(), strength))
+    k = math.ceil(len(text) / max_chars)
+    cuts: List[int] = []
+    last = 0
+    for i in range(1, k):
+        target = last + (len(text) - last) / (k - i + 1)
+        window = (len(text) - last) / (k - i + 1) * 0.35
+        near = [(pos, st) for pos, st in cands if last + 20 < pos < len(text) - 20 and abs(pos - target) <= window]
+        if not near:
+            continue
+        pos = max(near, key=lambda c: (c[1], -abs(c[0] - target)))[0]
+        cuts.append(pos)
+        last = pos
+    if not cuts:
+        return [text]
+    bounds = [0] + cuts + [len(text)]
+    return [text[x:y].strip() for x, y in zip(bounds, bounds[1:]) if text[x:y].strip()]
+
+
+# Loudness of an emotion line relative to the same voice's calm lines, in dB.
+# The emotion references come out 4-6 dB louder (or a short shout quieter),
+# which makes one voice sound like two people.
+EMOTION_LEVEL_DB = {"tense": 1.0, "shout": 4.0, "whisper": -3.0, "sad": -2.0}
+
+
+def active_rms_db(audio: np.ndarray, sr: int) -> Optional[float]:
+    win = max(1, int(sr * 0.05))
+    n = audio.size // win
+    if n == 0:
+        return None
+    frames = audio[: n * win].astype(np.float64).reshape(n, win)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    loud = rms[rms > 10 ** (-45 / 20)]
+    if loud.size == 0:
+        return None
+    return float(20 * np.log10(np.sqrt(np.mean(loud ** 2))))
+
+
+def level_emotion_lines(manifest_lines: List[Dict[str, Any]], lines_dir: str, sr: int) -> None:
+    """Bring every "Name:emotion" line to Name's calm loudness plus a small,
+    fixed offset per emotion. Idempotent, so cached lines are safe."""
+    levels: Dict[str, float] = {}
+    for m in manifest_lines:
+        audio, _ = read_wav(os.path.join(lines_dir, f"{m['id']}.wav"))
+        db = active_rms_db(audio, sr)
+        if db is not None:
+            levels[m["id"]] = db
+    calm: Dict[str, List[float]] = {}
+    for m in manifest_lines:
+        if ":" not in m["voice"] and m["id"] in levels and float(m.get("volume") or 1.0) == 1.0:
+            calm.setdefault(m["voice"], []).append(levels[m["id"]])
+    every = [x for v in calm.values() for x in v]
+    if not every:
+        return
+    for m in manifest_lines:
+        if ":" not in m["voice"] or m["id"] not in levels:
+            continue
+        base, emo = m["voice"].split(":", 1)
+        ref = float(np.median(calm.get(base) or every))
+        gain_db = float(np.clip(ref + EMOTION_LEVEL_DB.get(emo, 0.0) - levels[m["id"]], -9.0, 9.0))
+        m["gain_db"] = round(gain_db, 2)
+        if abs(gain_db) < 0.3:
+            continue
+        path = os.path.join(lines_dir, f"{m['id']}.wav")
+        audio, _ = read_wav(path)
+        audio = audio * (10 ** (gain_db / 20))
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 0.99:
+            audio = audio * (0.99 / peak)
+        write_wav(path, audio, sr)
+
+
 def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None) -> Dict[str, Any]:
     with open(os.path.join(job_dir, "job.json"), encoding="utf-8") as f:
         job = json.load(f)
@@ -491,6 +581,10 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
     engine = get_engine(engine_name, dict(job.get("engine_options", {}) or {}))
     sr = int(engine.sample_rate)
 
+    max_chars = int(job.get("max_synth_chars") or MAX_SYNTH_CHARS)
+    vc = get_vc(job.get("vc_lines", "none"), dict(job.get("vc_options", {}) or {}))
+    vc_work = os.path.join(out_dir, "vc_work")
+
     prompts: Dict[str, Any] = {}
     used_voices = sorted({ln["voice"] for ln in lines})
     for name in used_voices:
@@ -508,6 +602,10 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
         seed = int(voice.get("seed", 1234))
         text = apply_stress_mode(apply_lexicon(ln["text"], lexicon), stress_mode)
         key = line_cache_key(engine_name, language, voice, text, speed, seed, job.get("engine_options") or None) + (f"|v{volume}" if volume != 1.0 else "")
+        if len(split_for_synthesis(text, max_chars)) > 1:
+            key += f"|split{max_chars}"
+        if vc is not None and ":" in ln["voice"]:
+            key += f"|vc:{job.get('vc_lines')}:{voices.get(ln['voice'].split(':')[0], {}).get('ref_sha256')}"
         path = os.path.join(lines_dir, f"{ln['id']}.wav")
         key_path = path + ".key"
         reused = False
@@ -515,9 +613,27 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
             audio, _ = read_wav(path)
             reused = True
         else:
-            audio = engine.synth(text, prompts[ln["voice"]], voice, language, speed, seed)
             native_sr = int(getattr(engine, "sample_rate", sr))
-            audio = finish_tail(trim_silence(resample_linear(audio, native_sr, sr), sr), sr)
+            pieces = split_for_synthesis(text, max_chars)
+            audio = np.zeros(0, dtype=np.float32)
+            for n, piece in enumerate(pieces):
+                part = resample_linear(engine.synth(piece, prompts[ln["voice"]], voice, language, speed, seed),
+                                       native_sr, sr)
+                if len(pieces) > 1:
+                    part = trim_silence(part, sr, lead_ms=20 if n else 60, tail_ms=60)
+                    if n:
+                        audio = np.concatenate([audio, np.zeros(int(sr * PIECE_GAP_MS / 1000), np.float32)])
+                audio = np.concatenate([audio, part.astype(np.float32)])
+            base = ln["voice"].split(":")[0]
+            if vc is not None and ":" in ln["voice"] and base in voices:
+                # The emotion reference also bends the timbre; pull it back to
+                # the calm voice, keeping the words, rhythm and intonation.
+                os.makedirs(vc_work, exist_ok=True)
+                src = os.path.join(vc_work, "src.wav")
+                write_wav(src, audio, sr)
+                conv, conv_sr = vc.convert(src, voices[base]["ref_audio"], vc_work)
+                audio = resample_linear(conv, conv_sr, sr)
+            audio = finish_tail(trim_silence(audio, sr), sr)
             audio = audio * volume
             peak = float(np.max(np.abs(audio))) if audio.size else 0.0
             if peak > 0.99:
@@ -543,6 +659,8 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
         )
         elapsed = time.time() - started
         log(f"{idx}/{len(lines)} {ln['voice']}: {audio.size / sr:.1f}s audio ({elapsed:.0f}s elapsed)")
+
+    level_emotion_lines(manifest_lines, lines_dir, sr)
 
     # Timing only: the chapter and the per-voice stems are assembled on the
     # server from lines/ (orchestrate.py), so only one copy of the audio

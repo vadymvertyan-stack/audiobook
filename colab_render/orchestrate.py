@@ -206,13 +206,16 @@ def load_voices(path: str) -> Dict[str, Dict[str, Any]]:
 
 def resolve_emotions(chapters: List[Dict[str, Any]], voices: Dict[str, Dict[str, Any]]) -> None:
     """[emotion:X] picks the voice "Name:X" from the cast when it exists. That
-    reference already carries the loudness, so the line's volume tag goes."""
+    reference already carries the loudness and pace, so the line's volume and
+    speed tags go."""
     for c in chapters:
         for ln in c["lines"]:
             emo = ln.pop("emotion", None)
             if emo and f"{ln['voice']}:{emo}" in voices:
                 ln["voice"] = f"{ln['voice']}:{emo}"
+                # Its pace too: a [speed] on top stacked up to 1.33 for the narrator.
                 ln.pop("volume", None)
+                ln.pop("speed", None)
 
 
 def check_voices(chapters: List[Dict[str, Any]], voices: Dict[str, Dict[str, Any]]) -> List[str]:
@@ -335,6 +338,10 @@ def build_job(ch: Dict[str, Any], voices: Dict[str, Dict[str, Any]], settings: D
     lines = [dict(ln) for ln in ch["lines"]]
     assign_gaps(lines, settings.get("gap_ms"))
     used = sorted({ln["voice"] for ln in lines})
+    vc_lines = settings.get("vc_lines", "none")
+    if vc_lines != "none":
+        # Emotion lines get converted to the calm voice's timbre, so ship it.
+        used = sorted(set(used) | {v.split(":")[0] for v in used if ":" in v and v.split(":")[0] in voices})
     job_voices = {}
     files = {}
     for i, name in enumerate(used):
@@ -360,6 +367,7 @@ def build_job(ch: Dict[str, Any], voices: Dict[str, Dict[str, Any]], settings: D
         "gap_ms": settings.get("gap_ms", {}),
         "voices": job_voices,
         "lines": lines,
+        **({"vc_lines": vc_lines} if vc_lines != "none" else {}),
     }
     job["job_id"] = hashlib.sha256(json.dumps(job, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -577,6 +585,7 @@ def load_settings(args: argparse.Namespace) -> Dict[str, Any]:
         "language": args.language,
         "stress": args.stress,
         "lexicon": lexicon,
+        "vc_lines": getattr(args, "vc_lines", "none"),
     }
 
 
@@ -1663,6 +1672,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--stress", default="strip", choices=["strip", "acute", "keep"],
                     help="what to do with '+' stress marks: strip, turn into U+0301, or keep")
     sp.add_argument("--lexicon", default=None, help="JSON {word: respelling}")
+    sp.add_argument("--vc-lines", default="none", choices=["none", "seed-vc", "dummy"],
+                    help="convert every emotion line ('Name:tense', ...) to the calm voice's timbre after "
+                         "synthesis, so a character never sounds like a second person")
     sp.add_argument("--gpu", default="L4", help="T4, L4, A100, H100 or '' for CPU")
     sp.add_argument("--session", default=None, help="Colab session name")
     sp.add_argument("--keep", action="store_true", help="leave the session running afterwards (it keeps billing)")
