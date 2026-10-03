@@ -360,6 +360,18 @@ class KaggleTest(BookFixture):
         self.assertEqual([(ln["text"], ln.get("speed"), ln.get("volume")) for ln in lines],
                          [("Тихо.", 0.82, 0.55), ("— Огонь!", 1.08, None), ("Бежим.", 1.08, None)])
 
+    def test_finish_tail_fades_a_cut_ending_and_pads_silence(self):
+        import numpy as np
+        sr = 24000
+        cut = np.full(sr // 2, 0.3, dtype=np.float32)  # model stopped while loud
+        out = render_chapter.finish_tail(cut, sr)
+        self.assertEqual(out.size, cut.size + int(sr * 0.15))
+        self.assertTrue(np.all(out[cut.size:] == 0))
+        self.assertLess(abs(float(out[cut.size - 1])), 0.01)
+        quiet = np.concatenate([cut, np.zeros(sr // 10, dtype=np.float32)])
+        out = render_chapter.finish_tail(quiet, sr)
+        self.assertAlmostEqual(float(out[cut.size - 1]), 0.3, places=5)  # no fade needed
+
     def test_reference_mismatch(self):
         text = "Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопье́сы."
         self.assertIsNone(render_chapter.reference_mismatch(

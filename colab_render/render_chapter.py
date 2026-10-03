@@ -149,6 +149,21 @@ def trim_silence(audio: np.ndarray, sr: int, threshold: float = 0.002,
     return audio[start:end]
 
 
+def finish_tail(audio: np.ndarray, sr: int, fade_ms: int = 40, pad_ms: int = 150,
+                loud: float = 0.0056) -> np.ndarray:
+    """Let a line end softly. If the model stopped mid-decay (last 20 ms still
+    above -45 dBFS) fade the final `fade_ms`, then append real silence: the
+    trim above can only keep what the model produced, never add a tail."""
+    if audio.size == 0:
+        return audio
+    audio = audio.astype(np.float32, copy=True)
+    last = audio[-max(1, int(sr * 0.02)):]
+    if float(np.max(np.abs(last))) > loud:
+        n = min(audio.size, int(sr * fade_ms / 1000))
+        audio[-n:] *= (0.5 + 0.5 * np.cos(np.linspace(0.0, np.pi, n))).astype(np.float32)
+    return np.concatenate([audio, np.zeros(int(sr * pad_ms / 1000), dtype=np.float32)])
+
+
 # ---------------------------------------------------------------------------
 # Text: stress marks and lexicon
 # ---------------------------------------------------------------------------
@@ -299,6 +314,10 @@ class OmniVoiceEngine:
         self.options = {"fade_duration": 0.02, "pad_duration": 0.0}
         self.options.update(options or {})
         self.check_ref = bool(self.options.pop("check_ref", True))
+        # OmniVoice sizes each line from the reference's chars/second and the
+        # model stops when that budget runs out, sometimes inside the last
+        # word. A few % more room lets it finish; extra silence is trimmed.
+        self.headroom = float(self.options.pop("headroom", 1.08))
 
     def prepare_voice(self, voice_name: str, voice: Dict[str, Any]) -> Any:
         if self.check_ref:
@@ -324,6 +343,7 @@ class OmniVoiceEngine:
         kwargs = dict(self.options)
         if language:
             kwargs["language"] = language
+        speed = speed / self.headroom
         if abs(speed - 1.0) > 1e-3:
             kwargs["speed"] = speed
         audio = self.model.generate(text=text, voice_clone_prompt=prompt, **kwargs)
@@ -455,7 +475,7 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
         else:
             audio = engine.synth(text, prompts[ln["voice"]], voice, language, speed, seed)
             native_sr = int(getattr(engine, "sample_rate", sr))
-            audio = trim_silence(resample_linear(audio, native_sr, sr), sr)
+            audio = finish_tail(trim_silence(resample_linear(audio, native_sr, sr), sr), sr)
             audio = audio * volume
             peak = float(np.max(np.abs(audio))) if audio.size else 0.0
             if peak > 0.99:
