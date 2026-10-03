@@ -236,6 +236,8 @@ def _pip_install(*packages: str) -> None:
         raise NoInternet(
             f"no internet on this machine ({e}); on Kaggle, verify your phone number "
             "at kaggle.com/settings, otherwise notebooks run offline") from e
+    if not packages:
+        return
     log(f"pip install {' '.join(packages)}")
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", *packages], check=True)
 
@@ -699,6 +701,78 @@ class QwenDesigner:
         return str(res.get("text", "")).strip()
 
 
+class DummyVC:
+    """For tests: 'converts' by returning the source unchanged."""
+
+    def convert(self, source: str, target: str, workdir: str) -> Tuple[np.ndarray, int]:
+        return read_wav(source)
+
+
+class SeedVC:
+    """Seed-VC (github.com/Plachtaa/seed-vc) v1, zero-shot timbre conversion:
+    words, rhythm and emotion come from the source take, the voice itself from
+    the character's calm reference. It pins transformers 4.46, so it lives in
+    its own venv on top of the system torch and runs as a subprocess."""
+
+    REPO = "https://github.com/Plachtaa/seed-vc"
+    SKIP = re.compile(r"^(-|torch|torchvision|torchaudio)|gradio|FreeSimpleGUI|sounddevice", re.I)
+
+    def __init__(self, options: Optional[Dict[str, Any]] = None):
+        options = options or {}
+        import tempfile
+
+        self.steps = int(options.get("vc_steps", 30))
+        self.cfg = float(options.get("vc_cfg", 0.7))
+        self.repo = options.get("vc_dir") or os.path.join(tempfile.gettempdir(), "seed-vc")
+        self.python = os.path.join(self.repo, ".venv", "bin", "python")
+        if os.path.exists(self.python):
+            return
+        _pip_install()  # only checks for internet
+        if not os.path.isdir(os.path.join(self.repo, ".git")):
+            log("cloning Seed-VC")
+            subprocess.run(["git", "clone", "--depth", "1", self.REPO, self.repo], check=True)
+        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", os.path.join(self.repo, ".venv")],
+                       check=True)
+        with open(os.path.join(self.repo, "requirements.txt"), encoding="utf-8") as f:
+            reqs = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#") and not self.SKIP.search(ln)]
+        req = os.path.join(self.repo, "req-kaggle.txt")
+        with open(req, "w", encoding="utf-8") as f:
+            f.write("\n".join(reqs) + "\n")
+        log(f"installing Seed-VC requirements ({len(reqs)} packages, system torch kept)")
+        subprocess.run([self.python, "-m", "pip", "install", "-q", "-r", req], check=True)
+
+    def convert(self, source: str, target: str, workdir: str) -> Tuple[np.ndarray, int]:
+        import glob
+
+        out = os.path.join(workdir, "vc_out")
+        shutil.rmtree(out, ignore_errors=True)
+        os.makedirs(out)
+        cmd = [self.python, "inference.py", "--source", os.path.abspath(source), "--target", os.path.abspath(target),
+               "--output", out, "--diffusion-steps", str(self.steps), "--length-adjust", "1.0",
+               "--inference-cfg-rate", str(self.cfg), "--f0-condition", "False", "--auto-f0-adjust", "False",
+               "--semi-tone-shift", "0", "--fp16", "True"]
+        res = subprocess.run(cmd, cwd=self.repo, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Seed-VC failed: {(res.stderr or res.stdout)[-1500:]}")
+        files = glob.glob(os.path.join(out, "*.wav"))
+        if not files:
+            raise RuntimeError(f"Seed-VC wrote no file: {res.stdout[-800:]}")
+        import soundfile
+
+        audio, sr = soundfile.read(files[0], dtype="float32")
+        return to_mono_float(audio), int(sr)
+
+
+def get_vc(name: str, options: Dict[str, Any]) -> Any:
+    if name in ("", "none", None):
+        return None
+    if name == "dummy":
+        return DummyVC()
+    if name == "seed-vc":
+        return SeedVC(options)
+    raise SystemExit(f"unknown voice conversion: {name}")
+
+
 def get_designer(name: str, options: Dict[str, Any]) -> Any:
     if name == "dummy":
         return DummyDesigner(options)
@@ -714,10 +788,12 @@ def cast_voices(job_dir: str, out_dir: str) -> Dict[str, Any]:
     takes_n = max(1, int(job.get("takes", 3)))
     emotions: Dict[str, Dict[str, str]] = job["emotions"]
     designer = get_designer(job.get("design_engine", "qwen"), dict(job.get("design_options") or {}))
+    vc = get_vc(job.get("vc", "seed-vc"), dict(job.get("design_options") or {}))
     sr = designer.sample_rate
+    vc_work = os.path.join(out_dir, ".vc_work")
 
-    def take(text: str, instruct: str, seed: int, path: str) -> Dict[str, Any]:
-        audio = trim_silence(designer.design(text, instruct, language, seed), sr)
+    def finish_take(audio: np.ndarray, text: str, path: str, seed: Optional[int]) -> Dict[str, Any]:
+        audio = trim_silence(audio, sr)
         audio = np.concatenate([np.zeros(int(sr * 0.1), np.float32), audio.astype(np.float32),
                                 np.zeros(int(sr * 0.2), np.float32)])
         peak = float(np.max(np.abs(audio))) if audio.size else 0.0
@@ -733,6 +809,30 @@ def cast_voices(job_dir: str, out_dir: str) -> Dict[str, Any]:
                 "ok": problem is None, "problem": problem, "seconds": round(audio.size / sr, 2),
                 "emb": designer.embed(audio)}
 
+    def take(text: str, instruct: str, seed: int, path: str) -> Dict[str, Any]:
+        return finish_take(designer.design(text, instruct, language, seed), text, path, seed)
+
+    def given(src: str, text: str, path: str) -> Dict[str, Any]:
+        audio, a_sr = read_wav(src)
+        return finish_take(resample_linear(audio, a_sr, sr), text, path, None)
+
+    def to_timbre(takes: List[Dict[str, Any]], timbre: np.ndarray, timbre_wav: str, text: str,
+                  path: str) -> Optional[Dict[str, Any]]:
+        """Convert the best clean takes to the character's own voice until one
+        still says its text; None if none does (the line then uses calm)."""
+        pick_closest(takes, timbre)
+        pool = sorted(_clean_pool(takes), key=lambda t: -t["similarity"])
+        for t in pool[:2]:
+            os.makedirs(vc_work, exist_ok=True)
+            audio, a_sr = vc.convert(os.path.join(out_dir, t["file"]), timbre_wav, vc_work)
+            conv = finish_take(resample_linear(audio, a_sr, sr), text, path, t["seed"])
+            conv["similarity"] = round(cosine(conv["emb"], timbre), 4)
+            conv["converted_from"] = t["file"]
+            if conv["ok"]:
+                return conv
+            log(f"converted {t['file']} no longer says its text ({conv['problem']}); trying the next take")
+        return None
+
     report: Dict[str, Any] = {}
     voices: Dict[str, Dict[str, Any]] = {}
     for c_idx, (name, ch) in enumerate(job["characters"].items()):
@@ -746,8 +846,9 @@ def cast_voices(job_dir: str, out_dir: str) -> Dict[str, Any]:
             raise SystemExit(f"character '{name}' needs a description of the voice")
         if ch.get("ref_audio"):
             # An existing voice (e.g. the narrator): its emotions must match it.
-            ref, _ = read_wav(os.path.join(job_dir, ch["ref_audio"]))
-            timbre = designer.embed(ref)
+            timbre_wav = os.path.join(job_dir, ch["ref_audio"])
+            ref, ref_sr = read_wav(timbre_wav)
+            timbre = designer.embed(resample_linear(ref, ref_sr, sr))
             entry["timbre"] = "given reference"
             wanted = [e for e in emotions if e != "calm"]
         else:
@@ -758,19 +859,36 @@ def cast_voices(job_dir: str, out_dir: str) -> Dict[str, Any]:
             timbre = best["emb"]
             final = os.path.join(folder, "calm.wav")
             shutil.copy(os.path.join(out_dir, best["file"]), final)
+            timbre_wav = final
             entry["emotions"]["calm"] = _cast_summary(best, takes, final, out_dir, calm["text"])
             voices[name] = {"ref_audio": os.path.relpath(final, out_dir), "ref_text": calm["text"], "seed": base_seed}
             log(f"cast '{name}' calm: take {takes.index(best) + 1}/{takes_n}, heard: {best['heard']}")
             wanted = [e for e in emotions if e != "calm"]
         if ch.get("only_emotions"):
             wanted = [e for e in wanted if e in ch["only_emotions"]]
+        sources = ch.get("emotion_sources") or {}
+        if sources:
+            wanted = [e for e in wanted if e in sources]
         for e_idx, emo in enumerate(wanted, 1):
             spec = emotions[emo]
-            instruct = f"{description}. {spec.get('style', emo)}" if description else spec.get("style", emo)
-            takes = [take(spec["text"], instruct, base_seed + 100 * e_idx + k,
-                          os.path.join(cand_dir, f"{emo}_{k + 1}.wav")) for k in range(takes_n)]
-            best = pick_closest(takes, timbre)
+            if emo in sources:
+                # An emotion take chosen earlier: only convert it to the voice.
+                takes = [given(os.path.join(job_dir, sources[emo]), spec["text"],
+                               os.path.join(cand_dir, f"{emo}_given.wav"))]
+            else:
+                instruct = f"{description}. {spec.get('style', emo)}" if description else spec.get("style", emo)
+                takes = [take(spec["text"], instruct, base_seed + 100 * e_idx + k,
+                              os.path.join(cand_dir, f"{emo}_{k + 1}.wav")) for k in range(takes_n)]
             final = os.path.join(folder, f"{emo}.wav")
+            if vc is not None:
+                best = to_timbre(takes, timbre, timbre_wav, spec["text"], os.path.join(cand_dir, f"{emo}_vc.wav"))
+                if best is None:
+                    log(f"cast '{name}' {emo}: no take survived conversion; lines with it use the calm voice")
+                    entry["emotions"][emo] = {"warning": "dropped: no take said its text after conversion",
+                                              "takes": [{k: v for k, v in t.items() if k != "emb"} for t in takes]}
+                    continue
+            else:
+                best = pick_closest(takes, timbre)
             shutil.copy(os.path.join(out_dir, best["file"]), final)
             entry["emotions"][emo] = _cast_summary(best, takes, final, out_dir, spec["text"])
             voices[f"{name}:{emo}"] = {"ref_audio": os.path.relpath(final, out_dir), "ref_text": spec["text"],
@@ -792,6 +910,7 @@ def cast_voices(job_dir: str, out_dir: str) -> Dict[str, Any]:
     for n in names:
         report[n].pop("calm_emb")
     report["_between_characters"] = dict(sorted(pairs.items(), key=lambda kv: -kv[1]))
+    shutil.rmtree(vc_work, ignore_errors=True)
     with open(os.path.join(out_dir, "cast_report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     with open(os.path.join(out_dir, "voices.json"), "w", encoding="utf-8") as f:

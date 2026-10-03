@@ -521,6 +521,19 @@ class KaggleTest(BookFixture):
             report = json.load(f)
         self.assertEqual(len(report["Андрей"]["emotions"]["shout"]["takes"]), 2)
         self.assertTrue(os.path.exists(os.path.join(out, "cast", "Андрей", "takes", "shout_2.wav")))
+        self.assertTrue(report["Андрей"]["emotions"]["shout"]["chosen"]["converted_from"].endswith(".wav"))
+
+        # Re-convert the chosen takes only: nothing is designed again.
+        out2 = os.path.join(self.tmp, "cast2")
+        rc = orchestrate.main(["cast", cast, "--out", out2, "--voices", self.voices, "--design-engine", "dummy",
+                               "--backend", "local", "--convert-existing", os.path.join(out, "cast")])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(out2, "cast_report.json"), encoding="utf-8") as f:
+            report2 = json.load(f)
+        self.assertEqual(sorted(report2["Андрей"]["emotions"]), ["sad", "shout", "tense", "whisper"])
+        self.assertEqual(len(report2["Андрей"]["emotions"]["shout"]["takes"]), 1)
+        self.assertNotIn("calm", report2["Андрей"]["emotions"])  # calm is reused, not redesigned
+        self.assertEqual(sorted(report2["Диктор"]["emotions"]), ["tense"])
 
     def test_pick_closest_prefers_clean_takes(self):
         import numpy as np

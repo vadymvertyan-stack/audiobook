@@ -1401,7 +1401,10 @@ def load_cast(path: str) -> Dict[str, Any]:
 
 
 def build_cast_job(spec: Dict[str, Any], voices: Dict[str, Dict[str, Any]], settings: Dict[str, Any],
-                   zip_path: str, only: Optional[List[str]] = None) -> str:
+                   zip_path: str, only: Optional[List[str]] = None, existing: Optional[str] = None) -> str:
+    """existing: a cast folder from an earlier run (…/cast/<name>/<emotion>.wav).
+    Its calm voices and chosen emotion takes are reused and only converted to
+    each character's own timbre; nothing is designed again."""
     files: Dict[str, bytes] = {}
     characters: Dict[str, Any] = {}
     for i, (name, ch) in enumerate(spec["characters"].items()):
@@ -1418,6 +1421,24 @@ def build_cast_job(spec: Dict[str, Any], voices: Dict[str, Dict[str, Any]], sett
         wanted = ch.pop("emotions", None)
         if wanted:
             ch["only_emotions"] = wanted
+        if existing:
+            folder = os.path.join(existing, slug(name).rstrip("_") or name)
+            folder = folder if os.path.isdir(folder) else os.path.join(existing, name)
+            calm = os.path.join(folder, "calm.wav")
+            if not given and os.path.exists(calm):
+                with open(calm, "rb") as f:
+                    files[f"voices/{i:02d}.wav"] = f.read()
+                ch.update(ref_audio=f"voices/{i:02d}.wav", ref_text=spec["emotions"]["calm"]["text"])
+            sources = {}
+            for emo in spec["emotions"]:
+                path = os.path.join(folder, f"{emo}.wav")
+                if emo != "calm" and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        files[f"sources/{i:02d}_{emo}.wav"] = f.read()
+                    sources[emo] = f"sources/{i:02d}_{emo}.wav"
+            if not sources:
+                continue
+            ch["emotion_sources"] = sources
         characters[name] = ch
     if not characters:
         raise ValueError("no characters selected")
@@ -1427,6 +1448,7 @@ def build_cast_job(spec: Dict[str, Any], voices: Dict[str, Dict[str, Any]], sett
         "takes": settings["takes"],
         "design_engine": settings["design_engine"],
         "design_options": settings.get("design_options", {}),
+        "vc": settings.get("vc", "seed-vc"),
         "emotions": spec["emotions"],
         "characters": characters,
     }
@@ -1454,8 +1476,8 @@ def finish_cast(ch: Dict[str, Any], out_dir: str, out_zip: str, job_id: str, sta
         if name.startswith("_"):
             continue
         for emo, e in entry["emotions"].items():
-            chosen = e["chosen"]
-            summary[f"{name}:{emo}"] = {"file": os.path.join(out_dir, e["file"]),
+            chosen = e.get("chosen") or {}
+            summary[f"{name}:{emo}"] = {"file": os.path.join(out_dir, e["file"]) if e.get("file") else None,
                                         "similarity": chosen.get("similarity"), "heard": chosen.get("heard"),
                                         "warning": e.get("warning")}
     return {"voices": cast_voices, "summary": summary, "between_characters": report.get("_between_characters", {}),
@@ -1493,11 +1515,12 @@ def cmd_cast(args: argparse.Namespace) -> int:
         "takes": args.takes or int(spec.get("takes", 3)),
         "design_engine": args.design_engine,
         "design_options": json.loads(args.design_options) if args.design_options else {},
+        "vc": args.vc or ("dummy" if args.design_engine == "dummy" else "seed-vc"),
     }
     only = [x.strip() for x in args.characters.split(",")] if args.characters else None
     os.makedirs(args.out, exist_ok=True)
     tmp_zip = os.path.join(tempfile.gettempdir(), f"audiobook_cast_{os.getpid()}.zip")
-    job_id = build_cast_job(spec, voices, settings, tmp_zip, only)
+    job_id = build_cast_job(spec, voices, settings, tmp_zip, only, args.convert_existing)
     collected: List[Dict[str, Any]] = []
 
     def finish(ch, out_dir, out_zip, jid, started):
@@ -1647,7 +1670,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--takes", type=int, default=None, help="takes per emotion to choose from (default 3)")
     sp.add_argument("--language", default=None, help="Qwen language name, e.g. Russian (default from the cast file)")
     sp.add_argument("--design-engine", default="qwen", choices=["qwen", "dummy"])
-    sp.add_argument("--design-options", default=None, help='JSON, e.g. {"temperature": 0.8}')
+    sp.add_argument("--design-options", default=None, help='JSON, e.g. {"temperature": 0.8, "vc_steps": 30}')
+    sp.add_argument("--vc", default=None, choices=["seed-vc", "none", "dummy"],
+                    help="convert each emotion take to the character's own voice (default seed-vc)")
+    sp.add_argument("--convert-existing", default=None,
+                    help="cast folder of an earlier run: keep its takes, only convert them to each voice")
     sp.add_argument("--backend", default="kaggle", choices=["kaggle", "colab", "local"])
     sp.add_argument("--gpu", default="L4", help="Colab GPU")
     sp.add_argument("--session", default=None, help="Colab session name")
