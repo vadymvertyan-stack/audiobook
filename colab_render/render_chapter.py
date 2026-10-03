@@ -207,7 +207,16 @@ def apply_lexicon(text: str, lexicon: Dict[str, str]) -> str:
         return text
     pattern = re.compile(r"(?<!\w)(" + "|".join(re.escape(k) for k in keys) + r")(?!\w)", re.IGNORECASE)
     lowered = {k.lower(): v for k, v in lexicon.items()}
-    return pattern.sub(lambda m: lowered.get(m.group(0).lower(), m.group(0)), text)
+
+    def repl(m: "re.Match[str]") -> str:
+        word = m.group(0)
+        new = lowered.get(word.lower(), word)
+        # keep a sentence-initial capital: "Кобуры" -> "Кобуры́", not "кобуры́"
+        if word[:1].isupper() and new[:1].islower() and not word.isupper():
+            new = new[:1].upper() + new[1:]
+        return new
+
+    return pattern.sub(repl, text)
 
 
 # ---------------------------------------------------------------------------

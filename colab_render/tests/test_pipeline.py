@@ -372,6 +372,11 @@ class KaggleTest(BookFixture):
         out = render_chapter.finish_tail(quiet, sr)
         self.assertAlmostEqual(float(out[cut.size - 1]), 0.3, places=5)  # no fade needed
 
+    def test_lexicon_keeps_sentence_capital(self):
+        lex = {"кобуры": "кобуры\u0301", "АК-74": "а-ка семьдесят четыре"}
+        self.assertEqual(render_chapter.apply_lexicon("Кобуры и АК-74, кобуры.", lex),
+                         "Кобуры\u0301 и а-ка семьдесят четыре, кобуры\u0301.")
+
     def test_reference_mismatch(self):
         text = "Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопье́сы."
         self.assertIsNone(render_chapter.reference_mismatch(
