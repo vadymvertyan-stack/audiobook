@@ -638,5 +638,20 @@ class KaggleTest(BookFixture):
         self.assertEqual(orchestrate.Kaggle.username(), "fromfile")
 
 
+
+class KaggleWaitTimeoutTest(unittest.TestCase):
+    def test_hung_status_call_keeps_polling(self):
+        import subprocess
+        k = orchestrate.Kaggle.__new__(orchestrate.Kaggle)
+        answers = [subprocess.TimeoutExpired("kaggle", 120), "running", "complete"]
+
+        def status_word(*args):
+            a = answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        k.status_word = status_word
+        self.assertEqual(k.wait(["kernels", "status", "x"], {"complete"}, {"error"}, 0, 60), "complete")
+
 if __name__ == "__main__":
     unittest.main()

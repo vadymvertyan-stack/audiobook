@@ -527,6 +527,12 @@ class Kaggle(Cli):
         while True:
             try:
                 word = self.status_word(*args)
+            except subprocess.TimeoutExpired:
+                # The Kaggle API sometimes hangs for minutes, then answers in a
+                # second; a hung status call is "not known yet", not a failure.
+                if time.time() > deadline:
+                    raise
+                word = "timeout"
             except ColabError as e:
                 # A just-created dataset answers 403/404 for a little while.
                 if not retry_errors or time.time() > deadline:
@@ -1282,11 +1288,18 @@ def _render_kaggle(args: argparse.Namespace, todo: List[tuple], finish=None) -> 
             shutil.copy(tmp_zip, os.path.join(ds_dir, f"job_{ch['index']:03d}.job"))
         with open(os.path.join(ds_dir, "dataset-metadata.json"), "w", encoding="utf-8") as f:
             json.dump({"title": args.kaggle_dataset, "id": dataset_id, "licenses": [{"name": "CC0-1.0"}]}, f)
-        try:
-            kaggle.run("datasets", "status", dataset_id, timeout=120)
-            exists = True
-        except ColabError:
-            exists = False
+        exists = False
+        for attempt in range(3):
+            try:
+                kaggle.run("datasets", "status", dataset_id, timeout=120)
+                exists = True
+                break
+            except ColabError:
+                break
+            except subprocess.TimeoutExpired:
+                if attempt == 2:
+                    raise
+                time.sleep(10)
         created_ds = False
         if exists:
             try:
