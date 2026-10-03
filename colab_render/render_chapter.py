@@ -571,6 +571,7 @@ DESIGN_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 EMBED_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"  # only its speaker encoder is used
 ASR_MODEL = "openai/whisper-large-v3-turbo"
 LOW_SIMILARITY = 0.75
+TOO_ALIKE = 0.9  # two different characters this close in timbre are hard to tell apart
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -746,8 +747,21 @@ def cast_voices(job_dir: str, out_dir: str) -> Dict[str, Any]:
                                        "seed": base_seed}
             flag = "" if best["similarity"] >= LOW_SIMILARITY else "  <- timbre drifted, listen"
             log(f"cast '{name}' {emo}: similarity {best['similarity']:.2f}{flag}, heard: {best['heard']}")
+        entry["calm_emb"] = np.asarray(timbre, dtype=np.float64).ravel().tolist()
         report[name] = entry
 
+    # Characters must also sound different from each other.
+    names = [n for n in report if "calm_emb" in report[n]]
+    pairs = {}
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            sim = round(cosine(report[a]["calm_emb"], report[b]["calm_emb"]), 4)
+            pairs[f"{a} / {b}"] = sim
+            if sim >= TOO_ALIKE:
+                log(f"cast '{a}' and '{b}' sound alike (similarity {sim:.2f}); make one description more distinct")
+    for n in names:
+        report[n].pop("calm_emb")
+    report["_between_characters"] = dict(sorted(pairs.items(), key=lambda kv: -kv[1]))
     with open(os.path.join(out_dir, "cast_report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     with open(os.path.join(out_dir, "voices.json"), "w", encoding="utf-8") as f:

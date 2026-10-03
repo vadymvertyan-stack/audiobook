@@ -1390,12 +1390,15 @@ def finish_cast(ch: Dict[str, Any], out_dir: str, out_zip: str, job_id: str, sta
             v["ref_audio"] = os.path.join(os.path.abspath(out_dir), v["ref_audio"])
     summary = {}
     for name, entry in report.items():
+        if name.startswith("_"):
+            continue
         for emo, e in entry["emotions"].items():
             chosen = e["chosen"]
             summary[f"{name}:{emo}"] = {"file": os.path.join(out_dir, e["file"]),
                                         "similarity": chosen.get("similarity"), "heard": chosen.get("heard"),
                                         "warning": e.get("warning")}
-    return {"voices": cast_voices, "summary": summary, "wall_seconds": round(time.time() - started, 1)}
+    return {"voices": cast_voices, "summary": summary, "between_characters": report.get("_between_characters", {}),
+            "wall_seconds": round(time.time() - started, 1)}
 
 
 def merge_voices(path: str, new: Dict[str, Dict[str, Any]]) -> None:
@@ -1452,7 +1455,8 @@ def cmd_cast(args: argparse.Namespace) -> int:
                           + (["cast/*/takes/*.wav"] if args.publish_takes else []))
             if err:
                 note(f"WARNING: {err}")
-        return {"summary": info["summary"], "wall_seconds": info["wall_seconds"]}
+        return {"summary": info["summary"], "between_characters": info["between_characters"],
+                "wall_seconds": info["wall_seconds"]}
 
     todo = [({"index": 1, "title": "cast", "lines": []}, args.out, tmp_zip, job_id)]
     os.makedirs(STATE_DIR, exist_ok=True)

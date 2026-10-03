@@ -126,7 +126,7 @@ GPU P100 не підходить: сучасний PyTorch його вже не 
 1. **Кастинг.** У файлі акторів (приклад: `casts/echo_vol1.json`) кожен герой має опис голосу англійською (стать, вік, тембр, манера). Qwen3-TTS VoiceDesign генерує з цього опису спокійний голос і емоції: напружений, крик, шепіт, сум. Кожну емоцію генерує в кількох дублях (`--takes`), бо VoiceDesign щоразу трохи змінює тембр. Лишається дубль, найближчий за тембром до спокійного голосу; це вимірює енкодер голосу Qwen3-TTS Base. Кожен дубль перевіряє Whisper, тож кліп, який каже не свій текст, еталоном не стане. Для готового голосу (наприклад, диктора) вкажіть `"voice": "Диктор"`, і його емоції підбираються під наявний еталон.
 
    ```bash
-   python3 orchestrate.py cast casts/echo_vol1.json --out ~/audiobook-data/books/echo/cast \
+   python3 orchestrate.py cast casts/echo_vol1.json --out ~/audiobook-data/books/echo \
        --voices ~/audiobook-data/voices/echo/voices.json --backend kaggle
    ```
 
