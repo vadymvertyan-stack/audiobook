@@ -480,10 +480,16 @@ class KaggleTest(BookFixture):
         out = render_chapter.finish_tail(cut, sr)
         self.assertEqual(out.size, cut.size + int(sr * 0.15))
         self.assertTrue(np.all(out[cut.size:] == 0))
-        self.assertLess(abs(float(out[cut.size - 1])), 0.01)
-        quiet = np.concatenate([cut, np.zeros(sr // 10, dtype=np.float32)])
-        out = render_chapter.finish_tail(quiet, sr)
-        self.assertAlmostEqual(float(out[cut.size - 1]), 0.3, places=5)  # no fade needed
+        self.assertLess(abs(float(out[cut.size - 1])), 0.001)
+        self.assertGreater(float(out[cut.size - int(sr * 0.03)]), 0.05)  # gentle start of the fade
+        # Loud, then an instant drop to silence inside the array: fade before the drop.
+        dropped = np.concatenate([cut, np.zeros(sr // 10, dtype=np.float32)])
+        out = render_chapter.finish_tail(dropped, sr)
+        self.assertLess(abs(float(out[cut.size - 1])), 0.001)
+        # A natural decay is left alone.
+        decay = np.concatenate([cut, 0.3 * np.exp(-np.arange(sr // 5) / (sr * 0.02))]).astype(np.float32)
+        out = render_chapter.finish_tail(decay, sr)
+        self.assertTrue(np.allclose(out[:decay.size], decay))
 
     def test_lexicon_keeps_sentence_capital(self):
         lex = {"кобуры": "кобуры\u0301", "АК-74": "а-ка семьдесят четыре"}

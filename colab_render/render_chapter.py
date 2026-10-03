@@ -149,18 +149,26 @@ def trim_silence(audio: np.ndarray, sr: int, threshold: float = 0.002,
     return audio[start:end]
 
 
-def finish_tail(audio: np.ndarray, sr: int, fade_ms: int = 40, pad_ms: int = 150,
-                loud: float = 0.0056) -> np.ndarray:
-    """Let a line end softly. If the model stopped mid-decay (last 20 ms still
-    above -45 dBFS) fade the final `fade_ms`, then append real silence: the
-    trim above can only keep what the model produced, never add a tail."""
+def finish_tail(audio: np.ndarray, sr: int, fade_ms: int = 90, pad_ms: int = 150,
+                floor: float = 0.002, loud: float = 0.0056) -> np.ndarray:
+    """Let a line end softly. OmniVoice often stops while the voice is still
+    at -25..-40 dB and drops to silence within one codec frame, which sounds
+    clipped. Find where the voice really stops (last sample above -54 dB);
+    if the 20 ms before it are still loud (above -45 dB), fade the last
+    `fade_ms` before that point down to silence, then pad real silence."""
     if audio.size == 0:
         return audio
     audio = audio.astype(np.float32, copy=True)
-    last = audio[-max(1, int(sr * 0.02)):]
-    if float(np.max(np.abs(last))) > loud:
-        n = min(audio.size, int(sr * fade_ms / 1000))
-        audio[-n:] *= (0.5 + 0.5 * np.cos(np.linspace(0.0, np.pi, n))).astype(np.float32)
+    voiced = np.flatnonzero(np.abs(audio) > floor)
+    if voiced.size:
+        stop = int(voiced[-1]) + 1
+        before = audio[max(0, stop - int(sr * 0.02)):stop]
+        if before.size and float(np.max(np.abs(before))) > loud:
+            n = min(stop, int(sr * fade_ms / 1000))
+            # Slow at first, so the final consonant survives, then down to zero.
+            curve = np.cos(np.linspace(0.0, np.pi / 2, n)) ** 2
+            audio[stop - n:stop] *= curve.astype(np.float32)
+            audio[stop:] = 0.0
     return np.concatenate([audio, np.zeros(int(sr * pad_ms / 1000), dtype=np.float32)])
 
 
@@ -444,10 +452,13 @@ def get_engine(name: str, options: Dict[str, Any]) -> Any:
 # Rendering
 # ---------------------------------------------------------------------------
 
-def line_cache_key(engine: str, language: str, voice: Dict[str, Any], text: str, speed: float, seed: int) -> str:
+def line_cache_key(engine: str, language: str, voice: Dict[str, Any], text: str, speed: float, seed: int,
+                   options: Optional[Dict[str, Any]] = None) -> str:
+    # Engine options (tail, num_step, ...) change the audio too.
     payload = json.dumps(
-        [engine, language, voice.get("ref_text"), voice.get("ref_sha256"), text, round(speed, 4), seed],
-        ensure_ascii=False,
+        [engine, language, voice.get("ref_text"), voice.get("ref_sha256"), text, round(speed, 4), seed]
+        + ([options] if options else []),
+        ensure_ascii=False, sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -496,7 +507,7 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
         volume = float(ln.get("volume") or 1.0)
         seed = int(voice.get("seed", 1234))
         text = apply_stress_mode(apply_lexicon(ln["text"], lexicon), stress_mode)
-        key = line_cache_key(engine_name, language, voice, text, speed, seed) + (f"|v{volume}" if volume != 1.0 else "")
+        key = line_cache_key(engine_name, language, voice, text, speed, seed, job.get("engine_options") or None) + (f"|v{volume}" if volume != 1.0 else "")
         path = os.path.join(lines_dir, f"{ln['id']}.wav")
         key_path = path + ".key"
         reused = False
