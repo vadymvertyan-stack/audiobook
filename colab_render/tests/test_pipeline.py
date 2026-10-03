@@ -628,6 +628,45 @@ class KaggleTest(BookFixture):
         self.assertEqual(orchestrate.qwen_delivery("Very loud commanding shout"), "[emotion shout] [speed 1.08]")
         self.assertTrue(orchestrate.qwen_delivery("Whispering, incredibly slow").startswith("[emotion whisper]"))
 
+    def test_project_file_drives_render(self):
+        log = os.path.join(self.tmp, "rclone.log")
+        fake = os.path.join(self.tmp, "rclone")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/sh\necho "$@" >> {log}\n')
+        os.chmod(fake, 0o755)
+        proj = os.path.join(self.tmp, "book.json")
+        with open(proj, "w", encoding="utf-8") as f:
+            json.dump({"book": os.path.basename(self.book), "voices": os.path.relpath(self.voices, self.tmp),
+                       "commands": {"render": {"out": "proj_out", "engine": "dummy", "publish": "gdrive:B",
+                                               "engine_options": {"x": 1}}}}, f)
+        os.environ["RCLONE_BIN"] = fake
+        try:
+            rc = orchestrate.main(["--colab-bin", self.colab_bin, "render", "--project", proj, "--tag", "v2",
+                                   "--chapters", "1"])
+        finally:
+            os.environ.pop("RCLONE_BIN")
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "proj_out", "01_Розділ_1_Ліс", "chapter.wav")))
+        with open(log) as f:
+            calls = f.read()
+        self.assertIn("copyto", calls)
+        self.assertIn("gdrive:B/01_Розділ_1_Ліс_v2.mp3", calls)
+        # Nothing to render from: a clear message, not a traceback.
+        self.assertEqual(orchestrate.main(["render", "--voices", self.voices]), 2)
+
+    def test_lexicon_command(self):
+        lx = os.path.join(self.tmp, "lx.json")
+        proj = os.path.join(self.tmp, "p.json")
+        with open(proj, "w") as f:
+            json.dump({"lexicon": "lx.json"}, f)
+        self.assertEqual(orchestrate.main(["lexicon", "--project", proj, "кобуры", "кабуры́"]), 0)
+        self.assertEqual(orchestrate.main(["lexicon", "--project", proj, "Кобуры", "кобуры́"]), 0)
+        with open(lx, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"кобуры": "кобуры́"})
+        self.assertEqual(orchestrate.main(["lexicon", "--project", proj, "кобуры", "--remove"]), 0)
+        with open(lx, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {})
+
     def test_render_publishes_mp3_with_rclone(self):
         log = os.path.join(self.tmp, "rclone.log")
         fake = os.path.join(self.tmp, "rclone")

@@ -1162,6 +1162,46 @@ def publish(local_dir: str, remote: str, includes: List[str], binary: Optional[s
     return None
 
 
+def cmd_lexicon(args: argparse.Namespace) -> int:
+    data: Dict[str, str] = {}
+    if os.path.exists(args.lexicon):
+        with open(args.lexicon, encoding="utf-8") as f:
+            data = json.load(f)
+    if not args.word:
+        emit({"ok": True, "lexicon": args.lexicon, "entries": len(data), "words": data})
+        return 0
+    key = next((k for k in data if k.lower() == args.word.lower()), args.word)
+    old = data.get(key)
+    if args.remove:
+        data.pop(key, None)
+    elif args.spelling:
+        data[key] = args.spelling
+    else:
+        emit({"ok": True, "word": key, "spelling": old})
+        return 0
+    tmp = args.lexicon + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+        f.write("\n")
+    os.replace(tmp, args.lexicon)
+    emit({"ok": True, "word": key, "was": old, "now": data.get(key),
+          "note": "lines with this word are re-rendered on the next render; a stress mark on a word-initial "
+                  "е is read as ё, respell instead (йе́дкой)"})
+    return 0
+
+
+def publish_file(path: str, remote_path: str, binary: Optional[str] = None) -> Optional[str]:
+    rclone = binary or os.environ.get("RCLONE_BIN", "rclone")
+    try:
+        res = subprocess.run([rclone, "copyto", path, remote_path], capture_output=True, text=True, timeout=3600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"rclone failed: {e}"
+    if res.returncode != 0:
+        return f"rclone failed: {(res.stderr or res.stdout)[-500:]}"
+    note(f"uploaded {remote_path}")
+    return None
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     chapters, voices = load_book(args)
     problems = check_voices(chapters, voices)
@@ -1204,6 +1244,11 @@ def cmd_render(args: argparse.Namespace) -> int:
             info = finish_chapter(ch, ch_dir, out_zip, job_id, started)
             err = publish(ch_dir, f"{args.publish.rstrip('/')}/{os.path.basename(ch_dir)}",
                           ["*.mp3", "manifest.json"])
+            mp3 = os.path.join(ch_dir, "chapter.mp3")
+            if not err and getattr(args, "tag", None) and os.path.exists(mp3):
+                name = f"{os.path.basename(ch_dir)}_{args.tag}.mp3"
+                err = publish_file(mp3, f"{args.publish.rstrip('/')}/{name}")
+                info["published_as"] = name
             if err:
                 info["publish_error"] = err
                 note(f"WARNING: {err}")
@@ -1649,14 +1694,22 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _subparsers(parser: argparse.ArgumentParser) -> Dict[str, argparse.ArgumentParser]:
+    for a in parser._actions:
+        if isinstance(a, argparse._SubParsersAction):
+            return dict(a.choices)
+    return {}
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--colab-bin", default=None, help="path to the colab CLI (default: $COLAB_BIN or 'colab')")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def book_args(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("book", help="book script with # chapters and [voice:NAME] tags")
-        sp.add_argument("--voices", required=True, help="voices.json or old voice_library.json")
+        sp.add_argument("book", nargs="?", default=None,
+                        help="book script with # chapters and [voice:NAME] tags (or 'book' in --project)")
+        sp.add_argument("--voices", default=None, help="voices.json or old voice_library.json")
         sp.add_argument("--default-voice", default=None, help="voice for text before the first tag")
         sp.add_argument("--chapters", default=None, help="only these chapter numbers, e.g. 1,2,5")
 
@@ -1667,7 +1720,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("render", help="render chapters on a Colab GPU")
     book_args(sp)
-    sp.add_argument("--out", required=True, help="output directory")
+    sp.add_argument("--out", default=None, help="output directory")
     sp.add_argument("--engine", default="omnivoice", choices=["omnivoice", "voxcpm2", "dummy"])
     sp.add_argument("--engine-options", default=None, help='JSON passed to the engine, e.g. {"num_step": 32}')
     sp.add_argument("--language", default="uk", help="uk, ru, ... (OmniVoice uses it; VoxCPM2 ignores it)")
@@ -1696,11 +1749,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--poll-seconds", type=float, default=60.0, help="how often to check Kaggle status")
     sp.add_argument("--publish", default=None,
                     help="rclone destination for each chapter's mp3, e.g. gdrive:Audiobook/echo")
+    sp.add_argument("--tag", default=None,
+                    help="with --publish, also upload <chapter>_<tag>.mp3 to the destination root, e.g. v16")
     sp.set_defaults(func=cmd_render)
 
     sp = sub.add_parser("cast", help="design each character's voice and emotions (Qwen3-TTS VoiceDesign)")
-    sp.add_argument("cast", help="cast JSON: characters (description or existing voice) and optional emotions")
-    sp.add_argument("--out", required=True, help="folder for cast/<name>/<emotion>.wav, takes and the report")
+    sp.add_argument("cast", nargs="?", default=None,
+                    help="cast JSON: characters (description or existing voice) and optional emotions")
+    sp.add_argument("--out", default=None, help="folder for cast/<name>/<emotion>.wav, takes and the report")
     sp.add_argument("--voices", default=None, help="voices.json to read existing voices from and add the cast to")
     sp.add_argument("--characters", default=None, help="only these characters, comma separated")
     sp.add_argument("--takes", type=int, default=None, help="takes per emotion to choose from (default 3)")
@@ -1727,6 +1783,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--publish", default=None, help="rclone destination for the voices, e.g. gdrive:Audiobook/echo/cast")
     sp.add_argument("--publish-takes", action="store_true", help="also upload every take, not just the chosen ones")
     sp.set_defaults(func=cmd_cast, book=None)
+
+    sp = sub.add_parser("lexicon", help="add, change or remove a pronunciation (stress) fix")
+    sp.add_argument("word", nargs="?", default=None, help="the word as written in the book")
+    sp.add_argument("spelling", nargs="?", default=None,
+                    help="how the model should read it, e.g. кабуры́; omit to show the current entry")
+    sp.add_argument("--lexicon", default=None, help="lexicon JSON (or 'lexicon' in --project)")
+    sp.add_argument("--remove", action="store_true", help="delete the entry for the word")
+    sp.set_defaults(func=cmd_lexicon)
 
     sp = sub.add_parser("assemble", help="rebuild chapter.wav and stems from lines/")
     sp.add_argument("chapter_dir")
@@ -1765,8 +1829,60 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# Settings that hold file paths; in a project file they are relative to it.
+PROJECT_PATHS = {"book", "voices", "lexicon", "out", "cast", "convert_existing"}
+REQUIRED = {"plan": ["book", "voices"], "render": ["book", "voices", "out"], "cast": ["cast", "out"],
+            "lexicon": ["lexicon"]}
+
+
+def load_project(path: str, command: str) -> Dict[str, Any]:
+    """A book's settings in one JSON file, so a whole render is one short
+    command. Top-level keys apply to every command, "commands": {"render": {...},
+    "cast": {...}} to one; keys are the long option names (with _ or -)."""
+    with open(os.path.expanduser(path), encoding="utf-8") as f:
+        data = json.load(f)
+    base = os.path.dirname(os.path.abspath(os.path.expanduser(path)))
+    merged = {k: v for k, v in data.items() if k not in ("commands", "_comment")}
+    merged.update((data.get("commands") or {}).get(command) or {})
+    out: Dict[str, Any] = {}
+    for key, value in merged.items():
+        key = key.replace("-", "_")
+        if key in PROJECT_PATHS and isinstance(value, str) and ":" not in value[:3]:
+            value = os.path.join(base, os.path.expanduser(value))
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False)  # e.g. engine_options
+        out[key] = value
+    return out
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    project = None
+    if "--project" in argv:
+        i = argv.index("--project")
+        if i + 1 >= len(argv):
+            emit({"ok": False, "problems": ["--project needs a file"]})
+            return 2
+        project = argv[i + 1]
+        del argv[i:i + 2]
+    parser = build_parser()
+    if project:
+        command = next((a for a in argv if not a.startswith("-") and a in _subparsers(parser)), None)
+        if command:
+            sp = _subparsers(parser)[command]
+            known = {a.dest for a in sp._actions}
+            try:
+                settings = load_project(project, command)
+            except (OSError, json.JSONDecodeError) as e:
+                emit({"ok": False, "problems": [f"project file {project}: {e}"]})
+                return 2
+            sp.set_defaults(**{k: v for k, v in settings.items() if k in known})
+    args = parser.parse_args(argv)
+    missing = [f"{'' if k in ('book', 'cast') else '--'}{k.replace('_', '-')}"
+               for k in REQUIRED.get(args.cmd, []) if not getattr(args, k, None)]
+    if missing:
+        emit({"ok": False, "problems": [f"missing {', '.join(missing)} (pass it or put it in --project)"]})
+        return 2
     try:
         return args.func(args)
     except (ValueError, KeyError, FileNotFoundError, json.JSONDecodeError, ColabError) as e:

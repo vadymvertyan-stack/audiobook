@@ -4,7 +4,8 @@
 
 - `render_chapter.py` працює на VM Colab: озвучує главу через OmniVoice або VoxCPM2.
 - `orchestrate.py` працює на сервері (тільки стандартна бібліотека Python): готує задачу, керує `colab`, збирає главу й доріжки за голосами, стежить, щоб сесії не лишалися увімкненими.
-- `hermes/audiobook-colab/SKILL.md` — навичка для Hermes Agent: книга з Telegram → сценарій → рендер → mp3 назад.
+- `skills/audiobook-play/SKILL.md` — навичка для Hermes Agent та інших агентів (дешевої моделі достатньо): рендер, наголоси, голоси, mp3 на Google Drive.
+- `projects/echo.example.json` — налаштування книги для `--project`.
 
 ## Чому голос більше не «пливе»
 
@@ -160,10 +161,18 @@ OmniVoice рахує тривалість рядка з темпу еталон�
 - `--stress keep`: `+` лишається (для моделей, навчених на такій нотації).
 - `--lexicon words.json`: `{"слово": "написання для вимови"}` — найнадійніший спосіб виправити конкретне слово.
 
-## Hermes
+## Керування з Hermes чи іншого агента
 
-Скопіюйте `hermes/audiobook-colab/` у `~/.hermes/skills/` і додайте в Hermes cron:
-`python3 ~/audiobook/colab_render/orchestrate.py watchdog --stop` кожні 15 хвилин.
+Кожна книга має файл налаштувань (`projects/echo.example.json` як зразок), тож команди короткі:
+
+```bash
+python3 orchestrate.py plan    --project ~/audiobook-data/books/echo/book.json --chapters 1
+python3 orchestrate.py render  --project ~/audiobook-data/books/echo/book.json --chapters 1 --tag v16
+python3 orchestrate.py lexicon --project ~/audiobook-data/books/echo/book.json кобуры кобуры́
+```
+
+Параметри з командного рядка мають пріоритет над файлом. Навичка `skills/audiobook-play/SKILL.md` описує це для агента;
+скопіюйте теку в `~/.hermes/skills/` окремого агента Hermes (або в `.claude/skills/`, `.codex/skills/` тощо).
 
 ## Тести
 

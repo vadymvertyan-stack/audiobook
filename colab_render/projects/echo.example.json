@@ -1,0 +1,23 @@
+{
+ "_comment": "Settings of one book. Copy to ~/audiobook-data/books/<slug>/book.json and fix the paths. Relative paths are relative to this file. Keys are orchestrate.py option names.",
+ "book": "script.txt",
+ "voices": "~/audiobook-data/voices/echo/voices.json",
+ "lexicon": "~/audiobook/colab_render/lexicons/echo_ru.json",
+ "language": "ru",
+ "backend": "kaggle",
+ "kaggle_kernel": "audiobook-render",
+ "commands": {
+  "render": {
+   "out": "out",
+   "engine": "omnivoice",
+   "engine_options": {"end_suffix": " …"},
+   "publish": "gdrive:audio_drama/Эхо_последнего_рубежа/render_test"
+  },
+  "cast": {
+   "cast": "~/audiobook/colab_render/casts/echo_vol1.json",
+   "out": "cast",
+   "language": "Russian",
+   "publish": "gdrive:audio_drama/Эхо_последнего_рубежа/cast"
+  }
+ }
+}
