@@ -550,6 +550,221 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
     return manifest
 
 
+# ---------------------------------------------------------------------------
+# Casting: design each character's voice and its emotions before rendering
+# ---------------------------------------------------------------------------
+#
+# A cast job (job.json with "kind": "cast") holds characters (a voice
+# description, or an existing reference wav) and emotions (a delivery style
+# plus a sample sentence that fits it). For every character the GPU:
+#   1. designs the calm voice from the description, N takes, and keeps the
+#      most typical one (closest to the others): that is the character's timbre;
+#   2. designs every other emotion N times with "description + style" and
+#      keeps the take whose speaker embedding is closest to that timbre,
+#      because VoiceDesign drifts a little between generations;
+#   3. checks every take with Whisper, so a clip that does not say its text
+#      never becomes a reference (a mismatch leaks into every rendered line).
+# The result is cast/<character>/<emotion>.wav plus voices.json entries
+# "Name" (calm) and "Name:emotion", ready for the renderer.
+
+DESIGN_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+EMBED_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"  # only its speaker encoder is used
+ASR_MODEL = "openai/whisper-large-v3-turbo"
+LOW_SIMILARITY = 0.75
+
+
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    den = float(np.linalg.norm(a) * np.linalg.norm(b))
+    return float(a @ b) / den if den else 0.0
+
+
+def pick_typical(takes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The take closest on average to the other takes (ones that pass Whisper
+    first): an outlier timbre loses even if it came out first."""
+    pool = [t for t in takes if t["ok"]] or takes
+    if len(pool) == 1:
+        return pool[0]
+    best, best_score = pool[0], -2.0
+    for t in pool:
+        score = float(np.mean([cosine(t["emb"], o["emb"]) for o in pool if o is not t]))
+        t["typicality"] = round(score, 4)
+        if score > best_score:
+            best, best_score = t, score
+    return best
+
+
+def pick_closest(takes: List[Dict[str, Any]], timbre: np.ndarray) -> Dict[str, Any]:
+    for t in takes:
+        t["similarity"] = round(cosine(t["emb"], timbre), 4)
+    pool = [t for t in takes if t["ok"]] or takes
+    return max(pool, key=lambda t: t["similarity"])
+
+
+class DummyDesigner:
+    """For tests: a tone whose pitch depends on the seed; 'Whisper' hears the text."""
+
+    sample_rate = 24000
+
+    def __init__(self, options: Optional[Dict[str, Any]] = None):
+        self._last = ""
+
+    def design(self, text: str, instruct: str, language: str, seed: int) -> np.ndarray:
+        self._last = text
+        freq = 120.0 + (seed % 5) * 15.0
+        t = np.arange(int(self.sample_rate * 2.0)) / self.sample_rate
+        return (0.3 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+    def embed(self, audio: np.ndarray) -> np.ndarray:
+        spec = np.abs(np.fft.rfft(audio[: self.sample_rate]))
+        peak = int(np.argmax(spec))
+        return np.exp(-0.5 * ((np.arange(400) - peak) / 20.0) ** 2)
+
+    def transcribe(self, audio: np.ndarray, language: str) -> str:
+        return self._last
+
+
+class QwenDesigner:
+    """Qwen3-TTS VoiceDesign for the takes, the Qwen3-TTS Base speaker encoder
+    to compare timbres, Whisper to check what each take actually says."""
+
+    sample_rate = 24000
+
+    def __init__(self, options: Optional[Dict[str, Any]] = None):
+        options = options or {}
+        try:
+            import qwen_tts  # noqa: F401
+        except ImportError:
+            _pip_install("qwen-tts")
+        import torch
+        from qwen_tts import Qwen3TTSModel
+
+        self.torch = torch
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if device.startswith("cuda") else torch.float32
+        log(f"loading {options.get('design_model', DESIGN_MODEL)} on {device}")
+        self.designer = Qwen3TTSModel.from_pretrained(options.get("design_model", DESIGN_MODEL),
+                                                      device_map=device, dtype=dtype)
+        log(f"loading speaker encoder from {options.get('embed_model', EMBED_MODEL)}")
+        self.encoder = Qwen3TTSModel.from_pretrained(options.get("embed_model", EMBED_MODEL),
+                                                     device_map=device, dtype=dtype)
+        from transformers import pipeline
+
+        self.asr = pipeline("automatic-speech-recognition", model=options.get("asr_model", ASR_MODEL),
+                            torch_dtype=dtype, device=device)
+        self.gen = {k: options[k] for k in ("temperature", "top_p", "top_k") if k in options}
+
+    def design(self, text: str, instruct: str, language: str, seed: int) -> np.ndarray:
+        _seed_everything(seed)
+        wavs, sr = self.designer.generate_voice_design(text=text, instruct=instruct, language=language, **self.gen)
+        return resample_linear(to_mono_float(wavs[0]), int(sr), self.sample_rate)
+
+    def embed(self, audio: np.ndarray) -> np.ndarray:
+        with self.torch.inference_mode():
+            emb = self.encoder.model.extract_speaker_embedding(audio=audio.astype(np.float32), sr=self.sample_rate)
+        return emb.float().cpu().numpy()
+
+    def transcribe(self, audio: np.ndarray, language: str) -> str:
+        res = self.asr({"raw": audio.astype(np.float32), "sampling_rate": self.sample_rate},
+                       generate_kwargs={"language": language.lower(), "task": "transcribe"})
+        return str(res.get("text", "")).strip()
+
+
+def get_designer(name: str, options: Dict[str, Any]) -> Any:
+    if name == "dummy":
+        return DummyDesigner(options)
+    if name == "qwen":
+        return QwenDesigner(options)
+    raise SystemExit(f"unknown design engine: {name}")
+
+
+def cast_voices(job_dir: str, out_dir: str) -> Dict[str, Any]:
+    with open(os.path.join(job_dir, "job.json"), encoding="utf-8") as f:
+        job = json.load(f)
+    language = job.get("language", "Russian")
+    takes_n = max(1, int(job.get("takes", 3)))
+    emotions: Dict[str, Dict[str, str]] = job["emotions"]
+    designer = get_designer(job.get("design_engine", "qwen"), dict(job.get("design_options") or {}))
+    sr = designer.sample_rate
+
+    def take(text: str, instruct: str, seed: int, path: str) -> Dict[str, Any]:
+        audio = trim_silence(designer.design(text, instruct, language, seed), sr)
+        audio = np.concatenate([np.zeros(int(sr * 0.1), np.float32), audio.astype(np.float32),
+                                np.zeros(int(sr * 0.2), np.float32)])
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 0:
+            audio = audio * (0.9 / peak)
+        heard = designer.transcribe(audio, language)
+        problem = reference_mismatch(text, heard)
+        write_wav(path, audio, sr)
+        return {"file": os.path.relpath(path, out_dir), "seed": seed, "heard": heard,
+                "ok": problem is None, "problem": problem, "seconds": round(audio.size / sr, 2),
+                "emb": designer.embed(audio)}
+
+    report: Dict[str, Any] = {}
+    voices: Dict[str, Dict[str, Any]] = {}
+    for c_idx, (name, ch) in enumerate(job["characters"].items()):
+        folder = os.path.join(out_dir, "cast", re.sub(r"[^\w-]+", "_", name).strip("_") or f"voice{c_idx}")
+        cand_dir = os.path.join(folder, "takes")
+        os.makedirs(cand_dir, exist_ok=True)
+        description = (ch.get("description") or "").strip()
+        base_seed = int(ch.get("seed", 1000 + 97 * c_idx))
+        entry: Dict[str, Any] = {"description": description, "emotions": {}}
+        if not description:
+            raise SystemExit(f"character '{name}' needs a description of the voice")
+        if ch.get("ref_audio"):
+            # An existing voice (e.g. the narrator): its emotions must match it.
+            ref, _ = read_wav(os.path.join(job_dir, ch["ref_audio"]))
+            timbre = designer.embed(ref)
+            entry["timbre"] = "given reference"
+            wanted = [e for e in emotions if e != "calm"]
+        else:
+            calm = emotions.get("calm") or next(iter(emotions.values()))
+            takes = [take(calm["text"], f"{description}. {calm.get('style', '')}".strip(". "),
+                          base_seed + k, os.path.join(cand_dir, f"calm_{k + 1}.wav")) for k in range(takes_n)]
+            best = pick_typical(takes)
+            timbre = best["emb"]
+            final = os.path.join(folder, "calm.wav")
+            shutil.copy(os.path.join(out_dir, best["file"]), final)
+            entry["emotions"]["calm"] = _cast_summary(best, takes, final, out_dir, calm["text"])
+            voices[name] = {"ref_audio": os.path.relpath(final, out_dir), "ref_text": calm["text"], "seed": base_seed}
+            log(f"cast '{name}' calm: take {takes.index(best) + 1}/{takes_n}, heard: {best['heard']}")
+            wanted = [e for e in emotions if e != "calm"]
+        if ch.get("only_emotions"):
+            wanted = [e for e in wanted if e in ch["only_emotions"]]
+        for e_idx, emo in enumerate(wanted, 1):
+            spec = emotions[emo]
+            instruct = f"{description}. {spec.get('style', emo)}" if description else spec.get("style", emo)
+            takes = [take(spec["text"], instruct, base_seed + 100 * e_idx + k,
+                          os.path.join(cand_dir, f"{emo}_{k + 1}.wav")) for k in range(takes_n)]
+            best = pick_closest(takes, timbre)
+            final = os.path.join(folder, f"{emo}.wav")
+            shutil.copy(os.path.join(out_dir, best["file"]), final)
+            entry["emotions"][emo] = _cast_summary(best, takes, final, out_dir, spec["text"])
+            voices[f"{name}:{emo}"] = {"ref_audio": os.path.relpath(final, out_dir), "ref_text": spec["text"],
+                                       "seed": base_seed}
+            flag = "" if best["similarity"] >= LOW_SIMILARITY else "  <- timbre drifted, listen"
+            log(f"cast '{name}' {emo}: similarity {best['similarity']:.2f}{flag}, heard: {best['heard']}")
+        report[name] = entry
+
+    with open(os.path.join(out_dir, "cast_report.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(out_dir, "voices.json"), "w", encoding="utf-8") as f:
+        json.dump(voices, f, ensure_ascii=False, indent=2)
+    return report
+
+
+def _cast_summary(best: Dict[str, Any], takes: List[Dict[str, Any]], final: str, out_dir: str,
+                  text: str) -> Dict[str, Any]:
+    def clean(t: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in t.items() if k != "emb"}
+
+    return {"file": os.path.relpath(final, out_dir), "text": text, "chosen": clean(best),
+            "takes": [clean(t) for t in takes],
+            "warning": None if best["ok"] else "no take said its text cleanly; listen before using"}
+
+
 def zip_dir(src: str, dst_zip: str) -> None:
     with zipfile.ZipFile(dst_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for root, _, files in os.walk(src):
@@ -577,7 +792,8 @@ def run_one(job_zip: str, out_zip: str, workdir: str, engine_override: Optional[
         with zipfile.ZipFile(job_zip) as z:
             z.extractall(job_dir)
     with open(os.path.join(job_dir, "job.json"), encoding="utf-8") as f:
-        job_id = json.load(f).get("job_id", "")
+        job_meta = json.load(f)
+    job_id = job_meta.get("job_id", "")
     marker = os.path.join(out_dir, ".job_id")
     if os.path.isdir(out_dir) and _read_text(marker) != job_id:
         shutil.rmtree(out_dir)
@@ -585,7 +801,10 @@ def run_one(job_zip: str, out_zip: str, workdir: str, engine_override: Optional[
     with open(marker, "w") as f:
         f.write(job_id)
 
-    render_job(job_dir, out_dir, engine_override)
+    if job_meta.get("kind") == "cast":
+        cast_voices(job_dir, out_dir)
+    else:
+        render_job(job_dir, out_dir, engine_override)
     zip_dir(out_dir, out_zip)
     log(f"wrote {out_zip}")
     return job_id

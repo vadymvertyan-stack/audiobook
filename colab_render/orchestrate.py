@@ -65,6 +65,7 @@ PAUSE_TAG = re.compile(r"\[pause[\s:]*([\d.]+)\s*(ms|s)?\s*\]", re.IGNORECASE)
 # Per-line delivery, applies to the text on the same source line only.
 SPEED_TAG = re.compile(r"\[speed[\s:]*([\d.]+)\s*\]", re.IGNORECASE)
 VOLUME_TAG = re.compile(r"\[volume[\s:]*([\d.]+)\s*\]", re.IGNORECASE)
+EMOTION_TAG = re.compile(r"\[emotion[\s:]*([\w-]+)\s*\]", re.IGNORECASE)
 SENTENCE_END = re.compile(r"(?<=[.!?…])[\"»”)]*\s+")
 
 
@@ -126,6 +127,10 @@ def parse_book(text: str, default_voice: Optional[str] = None) -> List[Dict[str,
             if m:
                 delivery[key] = float(m.group(1))
                 line = tag.sub("", line).strip()
+        m = EMOTION_TAG.search(line)
+        if m:
+            delivery["emotion"] = m.group(1).lower()
+            line = EMOTION_TAG.sub("", line).strip()
         # A line may hold several [voice:] / [pause] tags; walk them in order.
         pos = 0
         tokens = sorted(
@@ -199,6 +204,17 @@ def load_voices(path: str) -> Dict[str, Dict[str, Any]]:
     return voices
 
 
+def resolve_emotions(chapters: List[Dict[str, Any]], voices: Dict[str, Dict[str, Any]]) -> None:
+    """[emotion:X] picks the voice "Name:X" from the cast when it exists. That
+    reference already carries the loudness, so the line's volume tag goes."""
+    for c in chapters:
+        for ln in c["lines"]:
+            emo = ln.pop("emotion", None)
+            if emo and f"{ln['voice']}:{emo}" in voices:
+                ln["voice"] = f"{ln['voice']}:{emo}"
+                ln.pop("volume", None)
+
+
 def check_voices(chapters: List[Dict[str, Any]], voices: Dict[str, Dict[str, Any]]) -> List[str]:
     problems = []
     used = sorted({ln["voice"] for c in chapters for ln in c["lines"]})
@@ -248,6 +264,7 @@ GAPS_MS = {
     "ellipsis": 800,    # after …
     "dialogue": 1000,   # into and out of a character's speech
     "speaker_change": 650,
+    "attribution": 350,  # "— К бою! | — заорал Андрей": speech, then the author's words
     "paragraph": 1200,
 }
 
@@ -357,6 +374,9 @@ def assemble(chapter_dir: str) -> Dict[str, Any]:
     with open(os.path.join(chapter_dir, "manifest.json"), encoding="utf-8") as f:
         manifest = json.load(f)
     sr = int(manifest["sample_rate"])
+    # One stem per character: "Андрей:shout" goes on Андрей's track.
+    for m in manifest["lines"]:
+        m["voice"] = m["voice"].split(":")[0]
     voices = sorted({m["voice"] for m in manifest["lines"]})
     chapter = bytearray()
     stems = {v: bytearray() for v in voices}
@@ -561,6 +581,7 @@ def load_book(args: argparse.Namespace):
         wanted = {int(x) for x in args.chapters.split(",")}
         chapters = [c for c in chapters if c["index"] in wanted]
     voices = load_voices(args.voices)
+    resolve_emotions(chapters, voices)
     return chapters, voices
 
 
@@ -583,8 +604,24 @@ QWEN_VOLUME = [
 ]
 
 
+# System_Prompt -> which of the character's emotion references to use
+# (see `cast`). First match wins; no match means the calm voice.
+QWEN_EMOTION = [
+    (re.compile(r"\b(whisper\w*|barely audible|hushed)\b", re.I), "whisper"),
+    (re.compile(r"\b(shout\w*|scream\w*|yell\w*|roar\w*|bellow\w*|battle cry|very loud|commanding)\b", re.I),
+     "shout"),
+    (re.compile(r"\b(sad\w*|sorrow\w*|grief|griev\w*|mournful|crying|tearful|despair\w*|broken)\b", re.I), "sad"),
+    (re.compile(r"\b(tense|tension|anxious|nervous|fear\w*|afraid|panic\w*|terrified|urgent|alarm\w*|"
+                r"angry|anger|furious|rage|menacing|threatening)\b", re.I), "tense"),
+]
+
+
 def qwen_delivery(prompt: str) -> str:
     tags = []
+    for rx, emo in QWEN_EMOTION:
+        if rx.search(prompt or ""):
+            tags.append(f"[emotion {emo}]")
+            break
     for table, name in ((QWEN_SPEED, "speed"), (QWEN_VOLUME, "volume")):
         for rx, value in table:
             if rx.search(prompt or ""):
@@ -715,6 +752,7 @@ def merge_breaths(items: List[Dict[str, Any]], prose: str, limit: int = MAX_BREA
     for it in items:
         prev = out[-1] if out else None
         if (prev and prev["span"] and it["span"] and len(prev["text"]) + 1 + len(it["text"]) <= limit
+                and prev.get("voice") == it.get("voice")
                 and (prev["pause"] == GAPS_MS["continue"]
                      or (prev["pause"] in soft and prev["tags"] == it["tags"]))):
             text = it["text"]
@@ -734,7 +772,201 @@ def merge_breaths(items: List[Dict[str, Any]], prose: str, limit: int = MAX_BREA
     return out
 
 
-def convert_qwen_scenes(src_dir: str, voice: str, prose_dir: Optional[str] = None) -> str:
+# ---------------------------------------------------------------------------
+# Who speaks: direct speech in the prose, attributed to characters
+# ---------------------------------------------------------------------------
+
+def speech_runs(prose: str) -> List[Tuple[int, int]]:
+    """(start, end) of every stretch of direct speech, in order. Their
+    numbers (1, 2, ...) are what speakers.json refers to."""
+    mask = _speech_mask(prose)
+    runs: List[Tuple[int, int]] = []
+    i = 0
+    while i < len(prose):
+        if not mask[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(prose) and mask[j]:
+            j += 1
+        a, b = i, j - 1
+        while a <= b and not prose[a].isalnum():
+            a += 1
+        while b >= a and prose[b] in " \t—–-":
+            b -= 1
+        if a <= b and any(c.isalpha() for c in prose[a:b + 1]):
+            runs.append((a, b))
+        i = j
+    return runs
+
+
+def _name_forms(cast: Dict[str, List[str]]) -> List[Tuple[re.Pattern, str]]:
+    """'Андрей' also matches 'Андрея', 'Андрею'... (a name plus up to two letters)."""
+    out = []
+    for name, aliases in cast.items():
+        for alias in [name, *aliases]:
+            stem = alias[:-1] if len(alias) > 4 and alias[-1] in "аяйьео" else alias
+            out.append((re.compile(r"(?<!\w)" + re.escape(stem) + r"\w{0,2}(?!\w)", re.IGNORECASE), name))
+    return out
+
+
+def guess_speakers(prose: str, cast: Dict[str, List[str]]) -> List[Optional[str]]:
+    """Without an LLM: a speaking verb right after the speech followed by a
+    cast name ("— К бою! — заорал Андрей"). Pronouns stay unknown."""
+    names = _name_forms(cast)
+    out: List[Optional[str]] = []
+    for a, b in speech_runs(prose):
+        after = prose[b + 1:b + 80].split("\n")[0]
+        found = None
+        if SPEECH_VERB.search(prose[max(0, b - 2):b + 1] + after):
+            words = re.match(r"[\s,!?.…»\"—–-]*((?:\w+[\s,]+){0,4}\w+)", after)
+            for rx, name in names:
+                if words and rx.search(words.group(1)):
+                    found = name
+                    break
+        out.append(found)
+    return out
+
+
+def llm_speakers(prose: str, cast: Dict[str, List[str]], url: str, model: str, key: Optional[str],
+                 timeout: float = 300.0) -> List[Optional[str]]:
+    """Ask an OpenAI-compatible chat endpoint (e.g. CLIProxy) who says each
+    numbered stretch of speech. Only cast names come back; anything else is None."""
+    import urllib.request
+
+    runs = speech_runs(prose)
+    if not runs:
+        return []
+    marked, pos = [], 0
+    for n, (a, b) in enumerate(runs, 1):
+        marked.append(prose[pos:a] + f"[S{n}]" + prose[a:b + 1] + f"[/S{n}]")
+        pos = b + 1
+    marked.append(prose[pos:])
+    cast_lines = "\n".join(f"- {n}" + (f" (also: {', '.join(a)})" if a else "") for n, a in cast.items())
+    prompt = (
+        "Below is a scene from a Russian novel. Every stretch of direct speech is wrapped in "
+        "[Sn]...[/Sn]. For each n, decide which character says it, using the author's words, "
+        "pronouns and the conversation flow. Characters:\n" + cast_lines +
+        "\nAnswer with JSON only, like {\"S1\": \"Андрей\", \"S2\": \"other\"}. Use exactly a name from "
+        "the list, or \"other\" for anyone else (a minor or unnamed character).\n\n" + "".join(marked))
+    body = json.dumps({"model": model, "temperature": 0,
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request(url.rstrip("/") + "/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json",
+                                          **({"Authorization": f"Bearer {key}"} if key else {})})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        answer = json.load(resp)["choices"][0]["message"]["content"]
+    m = re.search(r"\{.*\}", answer, re.S)
+    data = json.loads(m.group(0)) if m else {}
+    return [data.get(f"S{n}") if data.get(f"S{n}") in cast else None for n in range(1, len(runs) + 1)]
+
+
+def load_cast_names(path: str) -> Dict[str, List[str]]:
+    """{name: [aliases]} from a cast file; the narrator ("voice" entries) is not a speaker."""
+    with open(path, encoding="utf-8") as f:
+        spec = json.load(f)
+    return {n: list(c.get("aliases", [])) for n, c in spec["characters"].items() if not c.get("narrator")}
+
+
+def cmd_attribute(args: argparse.Namespace) -> int:
+    cast = load_cast_names(args.cast)
+    key = os.environ.get(args.llm_key_env) if args.llm_key_env else None
+    result: Dict[str, Any] = {}
+    if os.path.exists(args.out):
+        with open(args.out, encoding="utf-8") as f:
+            result = json.load(f)
+    names = sorted(n for n in os.listdir(args.prose) if QWEN_SCENE_FILE.search(n))
+    if args.only:
+        names = [n for n in names if re.search(args.only, n)]
+    stats = {"runs": 0, "named": 0, "llm_errors": 0}
+    for name in names:
+        prose = read_text(os.path.join(args.prose, name)) or ""
+        runs = speech_runs(prose)
+        guessed = guess_speakers(prose, cast)
+        asked: List[Optional[str]] = [None] * len(runs)
+        if args.llm_url and runs:
+            try:
+                asked = llm_speakers(prose, cast, args.llm_url, args.llm_model, key)
+            except Exception as e:  # keep going: the guesses still help
+                stats["llm_errors"] += 1
+                note(f"{name}: LLM failed ({e}); using the name-after-verb guesses only")
+        entries = []
+        for n, ((a, b), g, l) in enumerate(zip(runs, guessed, asked), 1):
+            who = l or g
+            entries.append({"n": n, "text": prose[a:b + 1][:120], "speaker": who,
+                            "how": "llm" if l else ("verb+name" if g else None)})
+            stats["runs"] += 1
+            stats["named"] += bool(who)
+        result[name] = entries
+        note(f"{name}: {sum(1 for e in entries if e['speaker'])}/{len(entries)} speech stretches attributed")
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=1)
+    emit({"ok": True, "out": args.out, "scenes": len(names), **stats})
+    return 0
+
+
+def split_speech(items: List[Dict[str, Any]], prose: str) -> List[Dict[str, Any]]:
+    """A TTS line can hold speech and the author's words ("— К бою! — заорал
+    Андрей."). Cut it where the prose switches, at the dash, so each side can
+    get its own voice. The author's side drops the line's delivery tags: the
+    System_Prompt described the speech."""
+    mask = _speech_mask(prose)
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        span = it["span"]
+        if not span:
+            out.append(it)
+            continue
+        cuts = [k for k in range(span[0] + 1, span[1] + 1) if mask[k] != mask[k - 1] and prose[k - 1:k + 1].strip()]
+        # A cut is where the prose mask flips; find the matching dash in the TTS text.
+        dashes = [m.start() for m in re.finditer(r"\s[—–]\s", it["text"])]
+        if not cuts or not dashes:
+            it["speech"] = mask[span[0]]
+            out.append(it)
+            continue
+        pieces, start = [], 0
+        for d in dashes[:len(cuts)]:
+            pieces.append(it["text"][start:d])
+            start = d + 1
+        pieces.append(it["text"][start:])
+        bounds = [span[0], *cuts, span[1] + 1]
+        speech = mask[span[0]]
+        for i, piece in enumerate(pieces):
+            piece = piece.strip().lstrip("—– ").strip()
+            if not piece:
+                speech = not speech
+                continue
+            a = bounds[min(i, len(bounds) - 2)]
+            b = bounds[min(i + 1, len(bounds) - 1)] - 1
+            last = i == len(pieces) - 1
+            out.append({"text": piece, "tags": it["tags"] if speech else "", "span": (a, b), "speech": speech,
+                        "pause": it["pause"] if last else GAPS_MS["attribution"]})
+            speech = not speech
+    return out
+
+
+def assign_speakers(items: List[Dict[str, Any]], prose: str, entries: List[Dict[str, Any]],
+                    narrator: str, voices: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    runs = speech_runs(prose)
+    counts: Dict[str, int] = {}
+    for it in items:
+        it["voice"] = narrator
+        if not it.get("speech") or not it["span"]:
+            continue
+        mid = (it["span"][0] + it["span"][1]) // 2
+        n = next((k for k, (a, b) in enumerate(runs, 1) if a - 2 <= mid <= b + 2), None)
+        who = next((e.get("speaker") for e in entries if e.get("n") == n), None) if n else None
+        if who and (voices is None or who in voices):
+            it["voice"] = who
+            counts[who] = counts.get(who, 0) + 1
+        else:
+            counts["(narrator)"] = counts.get("(narrator)", 0) + 1
+    return counts
+
+
+def convert_qwen_scenes(src_dir: str, voice: str, prose_dir: Optional[str] = None,
+                        speakers: Optional[Dict[str, Any]] = None,
+                        voices: Optional[Dict[str, Any]] = None) -> str:
     """Old Audio_Ready_Qwen exports: one file per scene, blocks of ID / Text /
     System_Prompt separated by '---'. Each scene becomes one chapter of the
     script, so a test can render a single scene. System_Prompt becomes
@@ -760,10 +992,17 @@ def convert_qwen_scenes(src_dir: str, voice: str, prose_dir: Optional[str] = Non
                 it["span"], it["pause"] = span, pause
             if items and items[0]["pause"] is None and re.match(r"(?i)глава|розділ|часть|частина", items[0]["text"]):
                 items[0]["pause"] = GAPS_MS["paragraph"]  # the spoken heading
+            if speakers is not None:
+                items = split_speech(items, prose)
+                counts = assign_speakers(items, prose, speakers.get(name, []), voice, voices)
+                note(f"{name}: speech lines by voice {counts}")
             items = merge_breaths(items, prose)
         out.append(f"# Глава {ch:02d}, сцена {sc}")
-        out.append(f"[voice:{voice}]")
+        current = None
         for it in items:
+            if it.get("voice", voice) != current:
+                current = it.get("voice", voice)
+                out.append(f"[voice:{current}]")
             line = f"{it['tags']} {it['text']}" if it["tags"] else it["text"]
             out.append(line if it["pause"] is None else f"{line} [pause {it['pause']}ms]")
         out.append("")
@@ -771,7 +1010,14 @@ def convert_qwen_scenes(src_dir: str, voice: str, prose_dir: Optional[str] = Non
 
 
 def cmd_import_qwen(args: argparse.Namespace) -> int:
-    script = convert_qwen_scenes(args.src, args.voice, args.prose)
+    speakers = None
+    if args.speakers:
+        if not args.prose:
+            raise SystemExit("--speakers needs --prose (speech is found in the original prose)")
+        with open(args.speakers, encoding="utf-8") as f:
+            speakers = json.load(f)
+    voices = load_voices(args.voices) if args.voices else None
+    script = convert_qwen_scenes(args.src, args.voice, args.prose, speakers, voices)
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(script)
     chapters = parse_book(script)
@@ -878,7 +1124,8 @@ def _write_lock(session: str, args: argparse.Namespace) -> None:
                    "started": time.time(), "book": args.book}, f)
 
 
-def _render_colab(args: argparse.Namespace, todo: List[tuple]) -> int:
+def _render_colab(args: argparse.Namespace, todo: List[tuple], finish=None) -> int:
+    finish = finish or finish_chapter
     colab = Colab(args.colab_bin)
     results = []
     session = args.session or f"audiobook-{time.strftime('%m%d-%H%M%S')}"
@@ -906,7 +1153,7 @@ def _render_colab(args: argparse.Namespace, todo: List[tuple]) -> int:
                 raise ColabError(f"chapter {ch['index']} did not finish on the VM:\n{exec_out[-2000:]}")
             out_zip = tmp_zip.replace("_job_", "_out_")
             colab.run("download", "-s", session, REMOTE_OUT, out_zip, timeout=1800)
-            results.append(finish_chapter(ch, ch_dir, out_zip, job_id, started))
+            results.append(finish(ch, ch_dir, out_zip, job_id, started))
             os.remove(out_zip)
     except (ColabError, subprocess.TimeoutExpired, zipfile.BadZipFile, OSError) as e:
         emit({"ok": False, "rendered": results, "error": str(e)[-1500:]})
@@ -928,7 +1175,8 @@ os.environ.setdefault("AUDIOBOOK_BATCH_OUT", "/kaggle/working")
 """
 
 
-def _render_kaggle(args: argparse.Namespace, todo: List[tuple]) -> int:
+def _render_kaggle(args: argparse.Namespace, todo: List[tuple], finish=None) -> int:
+    finish = finish or finish_chapter
     kaggle = Kaggle(args.kaggle_bin)
     user = Kaggle.username(args.kaggle_user, args.kaggle_bin)
     dataset_id = f"{user}/{args.kaggle_dataset}"
@@ -991,7 +1239,7 @@ def _render_kaggle(args: argparse.Namespace, todo: List[tuple]) -> int:
         # Surface the notebook's reference check (what Whisper heard) here too.
         for log_name in sorted(n for n in os.listdir(out_dir) if n.endswith(".log")):
             for line in (read_text(os.path.join(out_dir, log_name)) or "").splitlines():
-                if "reference '" in line:
+                if "reference '" in line or "cast '" in line:
                     note(line.strip())
         try:
             with open(os.path.join(out_dir, "batch_report.json"), encoding="utf-8") as f:
@@ -1013,7 +1261,7 @@ def _render_kaggle(args: argparse.Namespace, todo: List[tuple]) -> int:
                 # The notebook saw an older dataset version.
                 failures.append({"index": ch["index"], "error": "stale input on Kaggle, run again"})
             else:
-                results.append(finish_chapter(ch, ch_dir, out_zip, job_id, started))
+                results.append(finish(ch, ch_dir, out_zip, job_id, started))
         if final != "complete" or failures:
             log_tail = ""
             for name in os.listdir(out_dir):
@@ -1029,6 +1277,177 @@ def _render_kaggle(args: argparse.Namespace, todo: List[tuple]) -> int:
         shutil.rmtree(work, ignore_errors=True)
     emit({"ok": True, "backend": "kaggle", "kernel": kernel_id, "rendered": results})
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Casting: a voice per character, with its emotions, before rendering
+# ---------------------------------------------------------------------------
+
+# Delivery styles are English (Qwen3-TTS VoiceDesign follows English or
+# Chinese instructions best); the sample sentences are what each reference
+# says, so they carry the emotion in their words too.
+DEFAULT_EMOTIONS = {
+    "calm": {"style": "calm, even, unhurried delivery",
+             "text": "Я помню тот день до мелочей: серое небо, тишина и запах мокрой земли."},
+    "tense": {"style": "tense and anxious, low urgent voice, restrained fear",
+              "text": "Тихо. Слышишь? Они где-то рядом, не двигайся и держи оружие наготове."},
+    "shout": {"style": "shouting at full voice, commanding, furious",
+              "text": "Все в укрытие! Быстро, я сказал! Огонь по левому флангу, не жалеть патронов!"},
+    "whisper": {"style": "whispering very quietly, breathy, almost silent",
+                "text": "Не шуми. Подожди здесь, я проверю, что там за поворотом, и сразу вернусь."},
+    "sad": {"style": "sad and grieving, slow, voice breaking with pain",
+            "text": "Его больше нет. Я не успел, понимаешь? Просто не успел, а он так ждал."},
+}
+
+
+def load_cast(path: str) -> Dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        spec = json.load(f)
+    emotions = {k: dict(v) for k, v in DEFAULT_EMOTIONS.items()}
+    for name, e in (spec.get("emotions") or {}).items():
+        emotions.setdefault(name, {}).update(e)
+    spec["emotions"] = {k: v for k, v in emotions.items() if v.get("text")}
+    if not spec.get("characters"):
+        raise ValueError("cast file has no characters")
+    return spec
+
+
+def build_cast_job(spec: Dict[str, Any], voices: Dict[str, Dict[str, Any]], settings: Dict[str, Any],
+                   zip_path: str, only: Optional[List[str]] = None) -> str:
+    files: Dict[str, bytes] = {}
+    characters: Dict[str, Any] = {}
+    for i, (name, ch) in enumerate(spec["characters"].items()):
+        if only and name not in only:
+            continue
+        ch = dict(ch)
+        given = ch.pop("voice", None)
+        if given:
+            # Emotions for a voice that already exists, e.g. the narrator.
+            v = voices[given]
+            with open(v["ref_audio"], "rb") as f:
+                files[f"voices/{i:02d}.wav"] = f.read()
+            ch.update(ref_audio=f"voices/{i:02d}.wav", ref_text=v["ref_text"])
+        wanted = ch.pop("emotions", None)
+        if wanted:
+            ch["only_emotions"] = wanted
+        characters[name] = ch
+    if not characters:
+        raise ValueError("no characters selected")
+    job = {
+        "kind": "cast",
+        "language": settings["language"],
+        "takes": settings["takes"],
+        "design_engine": settings["design_engine"],
+        "design_options": settings.get("design_options", {}),
+        "emotions": spec["emotions"],
+        "characters": characters,
+    }
+    job["job_id"] = hashlib.sha256(json.dumps(job, ensure_ascii=False, sort_keys=True).encode()
+                                   + b"".join(files[k] for k in sorted(files))).hexdigest()[:16]
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("job.json", json.dumps(job, ensure_ascii=False, indent=2))
+        for rel, data in files.items():
+            z.writestr(rel, data)
+    return job["job_id"]
+
+
+def finish_cast(ch: Dict[str, Any], out_dir: str, out_zip: str, job_id: str, started: float) -> Dict[str, Any]:
+    with zipfile.ZipFile(out_zip) as z:
+        z.extractall(out_dir)
+    with open(os.path.join(out_dir, "voices.json"), encoding="utf-8") as f:
+        cast_voices = json.load(f)
+    with open(os.path.join(out_dir, "cast_report.json"), encoding="utf-8") as f:
+        report = json.load(f)
+    for v in cast_voices.values():
+        if not os.path.isabs(v["ref_audio"]):
+            v["ref_audio"] = os.path.join(os.path.abspath(out_dir), v["ref_audio"])
+    summary = {}
+    for name, entry in report.items():
+        for emo, e in entry["emotions"].items():
+            chosen = e["chosen"]
+            summary[f"{name}:{emo}"] = {"file": os.path.join(out_dir, e["file"]),
+                                        "similarity": chosen.get("similarity"), "heard": chosen.get("heard"),
+                                        "warning": e.get("warning")}
+    return {"voices": cast_voices, "summary": summary, "wall_seconds": round(time.time() - started, 1)}
+
+
+def merge_voices(path: str, new: Dict[str, Dict[str, Any]]) -> None:
+    data: Dict[str, Any] = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    data.update(new)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def cmd_cast(args: argparse.Namespace) -> int:
+    spec = load_cast(args.cast)
+    voices = load_voices(args.voices) if args.voices and os.path.exists(args.voices) else {}
+    problems = []
+    for name, ch in spec["characters"].items():
+        if ch.get("voice") and ch["voice"] not in voices:
+            problems.append(f"character '{name}': voice '{ch['voice']}' is not in {args.voices}")
+        if not (ch.get("description") or "").strip():
+            # Also for an existing voice: its emotion takes are designed from
+            # the description and the closest timbre is kept.
+            problems.append(f"character '{name}' needs a description of the voice")
+    if problems:
+        emit({"ok": False, "problems": problems})
+        return 2
+    settings = {
+        "language": args.language or spec.get("language", "Russian"),
+        "takes": args.takes or int(spec.get("takes", 3)),
+        "design_engine": args.design_engine,
+        "design_options": json.loads(args.design_options) if args.design_options else {},
+    }
+    only = [x.strip() for x in args.characters.split(",")] if args.characters else None
+    os.makedirs(args.out, exist_ok=True)
+    tmp_zip = os.path.join(tempfile.gettempdir(), f"audiobook_cast_{os.getpid()}.zip")
+    job_id = build_cast_job(spec, voices, settings, tmp_zip, only)
+    collected: List[Dict[str, Any]] = []
+
+    def finish(ch, out_dir, out_zip, jid, started):
+        info = finish_cast(ch, out_dir, out_zip, jid, started)
+        for vname, v in info["voices"].items():
+            # "Диктор:tense" reads at the narrator's speed and seed.
+            base = voices.get(vname.split(":")[0])
+            if base:
+                v["speed"], v["seed"] = base["speed"], base["seed"]
+        if args.voices:
+            merge_voices(args.voices, info["voices"])
+            note(f"added {len(info['voices'])} voice(s) to {args.voices}")
+        collected.append(info)
+        return {"summary": info["summary"], "wall_seconds": info["wall_seconds"]}
+
+    todo = [({"index": 1, "title": "cast", "lines": []}, args.out, tmp_zip, job_id)]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        if args.backend == "local":
+            import importlib.util
+
+            spec_mod = importlib.util.spec_from_file_location("render_chapter", RENDER_SCRIPT)
+            rc = importlib.util.module_from_spec(spec_mod)
+            spec_mod.loader.exec_module(rc)
+            out_zip = tmp_zip.replace("_cast_", "_castout_")
+            started = time.time()
+            rc.run_one(tmp_zip, out_zip, tempfile.mkdtemp(prefix="audiobook_castwork_"))
+            result = finish(todo[0][0], args.out, out_zip, job_id, started)
+            os.remove(out_zip)
+            emit({"ok": True, "backend": "local", "rendered": [result]})
+            return 0
+        if args.backend == "kaggle":
+            return _render_kaggle(args, todo, finish)
+        return _render_colab(args, todo, finish)
+    finally:
+        if os.path.exists(tmp_zip):
+            os.remove(tmp_zip)
+        try:
+            os.remove(LOCK_PATH)
+        except OSError:
+            pass
 
 
 def cmd_assemble(args: argparse.Namespace) -> int:
@@ -1121,6 +1540,29 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--poll-seconds", type=float, default=60.0, help="how often to check Kaggle status")
     sp.set_defaults(func=cmd_render)
 
+    sp = sub.add_parser("cast", help="design each character's voice and emotions (Qwen3-TTS VoiceDesign)")
+    sp.add_argument("cast", help="cast JSON: characters (description or existing voice) and optional emotions")
+    sp.add_argument("--out", required=True, help="folder for cast/<name>/<emotion>.wav, takes and the report")
+    sp.add_argument("--voices", default=None, help="voices.json to read existing voices from and add the cast to")
+    sp.add_argument("--characters", default=None, help="only these characters, comma separated")
+    sp.add_argument("--takes", type=int, default=None, help="takes per emotion to choose from (default 3)")
+    sp.add_argument("--language", default=None, help="Qwen language name, e.g. Russian (default from the cast file)")
+    sp.add_argument("--design-engine", default="qwen", choices=["qwen", "dummy"])
+    sp.add_argument("--design-options", default=None, help='JSON, e.g. {"temperature": 0.8}')
+    sp.add_argument("--backend", default="kaggle", choices=["kaggle", "colab", "local"])
+    sp.add_argument("--gpu", default="L4", help="Colab GPU")
+    sp.add_argument("--session", default=None, help="Colab session name")
+    sp.add_argument("--keep", action="store_true", help="leave the Colab session running afterwards")
+    sp.add_argument("--chapter-timeout", type=int, default=3 * 3600, help="seconds for the cast job (Colab)")
+    sp.add_argument("--kaggle-bin", default=None)
+    sp.add_argument("--kaggle-user", default=None)
+    sp.add_argument("--kaggle-dataset", default="audiobook-cast")
+    sp.add_argument("--kaggle-kernel", default="audiobook-cast")
+    sp.add_argument("--kaggle-accelerator", default="NvidiaTeslaT4")
+    sp.add_argument("--kaggle-max-hours", type=int, default=4)
+    sp.add_argument("--poll-seconds", type=float, default=60.0)
+    sp.set_defaults(func=cmd_cast, book=None)
+
     sp = sub.add_parser("assemble", help="rebuild chapter.wav and stems from lines/")
     sp.add_argument("chapter_dir")
     sp.set_defaults(func=cmd_assemble)
@@ -1132,7 +1574,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--prose", default=None,
                     help="folder with the original prose under the same file names; pauses follow its "
                          "sentences, paragraphs and dialogue")
+    sp.add_argument("--speakers", default=None,
+                    help="speakers.json from `attribute`: character lines get the character's voice")
+    sp.add_argument("--voices", default=None,
+                    help="with --speakers: characters missing from this voices file stay with the narrator")
     sp.set_defaults(func=cmd_import_qwen)
+
+    sp = sub.add_parser("attribute", help="find who says each line of direct speech (LLM and/or name after verb)")
+    sp.add_argument("prose", help="folder with the original prose scene files")
+    sp.add_argument("--cast", required=True, help="cast JSON (character names and aliases)")
+    sp.add_argument("--out", required=True, help="speakers.json to write (existing scenes are replaced)")
+    sp.add_argument("--only", default=None, help="regex on file names, e.g. chapter_01_")
+    sp.add_argument("--llm-url", default=None, help="OpenAI-compatible base URL, e.g. http://127.0.0.1:8317/v1")
+    sp.add_argument("--llm-model", default="qoder-qwen3.8-flash")
+    sp.add_argument("--llm-key-env", default=None, help="env var holding the API key, if the endpoint needs one")
+    sp.set_defaults(func=cmd_attribute)
 
     sp = sub.add_parser("usage", help="compute units balance and burn rate")
     sp.set_defaults(func=cmd_usage)

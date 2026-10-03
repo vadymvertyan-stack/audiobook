@@ -320,6 +320,106 @@ class KaggleTest(BookFixture):
             g["line"], g["line"], 0,
         ])
 
+    SCENE_LINES = [
+        "Андрей вжался в осыпающийся бруствер окопа.",
+        "Пятьдесят третий, я Скиф!",
+        "Квадрат семь ноль два накрыт плотным огнем! — прохрипел Андрей в тангенту радиостанции.",
+        "Прижимая гарнитуру к уху грязной перчаткой.",
+        "Противник лезет по лесополке! Дайте огня, братики, нас тут сейчас размотают!",
+        "Эфир ответил лишь шипением статических помех. РЭБ противника глушил связь намертво.",
+        "Они нас здесь похоронят, Скиф... — прошептал он срывающимся голосом.",
+        "Мы отсюда не выйдем...",
+    ]
+
+    def test_speech_runs_and_name_guesses(self):
+        runs = orchestrate.speech_runs(self.PROSE)
+        texts = [self.PROSE[a:b + 1] for a, b in runs]
+        self.assertEqual(len(texts), 4)
+        self.assertTrue(texts[0].startswith("Пятьдесят третий") and texts[0].endswith("огнем!"))
+        self.assertTrue(texts[2].startswith("Они нас здесь похоронят"))
+        cast = {"Андрей": ["Скиф"], "Лис": []}
+        self.assertEqual(orchestrate.guess_speakers(self.PROSE, cast), ["Андрей", None, None, None])
+
+    def test_attribute_asks_the_llm_and_keeps_name_guesses(self):
+        import http.server
+        import threading
+        seen = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen["prompt"] = body["messages"][0]["content"]
+                seen["auth"] = self.headers.get("Authorization")
+                reply = {"choices": [{"message": {"content": 'Sure: {"S1": "Андрей", "S2": "Андрей", '
+                                                             '"S3": "Лис", "S4": "Лис", "S5": "Ромео"}'}}]}
+                data = json.dumps(reply, ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        prose_dir = os.path.join(self.tmp, "prose")
+        os.makedirs(prose_dir)
+        with open(os.path.join(prose_dir, "vol1_chapter_01_scene1.md"), "w", encoding="utf-8") as f:
+            f.write(self.PROSE)
+        cast = os.path.join(self.tmp, "cast.json")
+        with open(cast, "w", encoding="utf-8") as f:
+            json.dump({"characters": {"Диктор": {"narrator": True, "voice": "Диктор", "description": "x"},
+                                      "Андрей": {"aliases": ["Скиф"], "description": "x"},
+                                      "Лис": {"description": "x"}}}, f, ensure_ascii=False)
+        out = os.path.join(self.tmp, "speakers.json")
+        os.environ["TEST_LLM_KEY"] = "secret"
+        try:
+            rc = orchestrate.main(["attribute", prose_dir, "--cast", cast, "--out", out,
+                                   "--llm-url", f"http://127.0.0.1:{srv.server_port}/v1",
+                                   "--llm-key-env", "TEST_LLM_KEY"])
+        finally:
+            srv.shutdown()
+            os.environ.pop("TEST_LLM_KEY")
+        self.assertEqual(rc, 0)
+        self.assertIn("[S3]Они нас здесь похоронят", seen["prompt"])
+        self.assertNotIn("- Диктор", seen["prompt"])
+        self.assertEqual(seen["auth"], "Bearer secret")
+        with open(out, encoding="utf-8") as f:
+            entries = json.load(f)["vol1_chapter_01_scene1.md"]
+        self.assertEqual([e["speaker"] for e in entries], ["Андрей", "Андрей", "Лис", "Лис"])
+
+    def test_import_with_speakers_gives_characters_their_voices(self):
+        src, prose_dir = os.path.join(self.tmp, "qwen"), os.path.join(self.tmp, "prose")
+        os.makedirs(src)
+        os.makedirs(prose_dir)
+        name = "vol1_chapter_01_scene1.md"
+        with open(os.path.join(src, name), "w", encoding="utf-8") as f:
+            f.write("\n---\n".join(f"ID: {i:04d}\nText: {t}\nSystem_Prompt: "
+                                    + ("Hoarse shout" if i == 3 else "Calm")
+                                    for i, t in enumerate(self.SCENE_LINES, 1)))
+        with open(os.path.join(prose_dir, name), "w", encoding="utf-8") as f:
+            f.write(self.PROSE)
+        speakers = {name: [{"n": 1, "speaker": "Андрей"}, {"n": 2, "speaker": "Андрей"},
+                           {"n": 3, "speaker": "Лис"}, {"n": 4, "speaker": None}]}
+        script = orchestrate.convert_qwen_scenes(src, "Диктор", prose_dir, speakers)
+        lines = orchestrate.parse_book(script)[0]["lines"]
+        got = [(ln["voice"], ln["text"][:24]) for ln in lines]
+        self.assertIn(("Андрей", "Пятьдесят третий, я Скиф"), [(v, t[:24]) for v, t in got])
+        voice_of = {t[:12]: v for v, t in got}
+        self.assertEqual(voice_of["Квадрат семь"], "Андрей")
+        self.assertEqual(voice_of["прохрипел Ан"], "Диктор")  # the author's words stay with the narrator
+        self.assertEqual(voice_of["Противник ле"], "Андрей")
+        self.assertEqual(voice_of["Они нас здес"], "Лис")
+        self.assertEqual(voice_of["прошептал он"], "Диктор")
+        self.assertEqual(voice_of["Мы отсюда не"], "Диктор")  # unattributed speech: narrator
+        shout = next(ln for ln in lines if ln["text"].startswith("Квадрат"))
+        self.assertEqual(shout.get("emotion"), "shout")
+        author = next(ln for ln in lines if ln["text"].startswith("прохрипел"))
+        self.assertNotIn("emotion", author)  # System_Prompt described the speech, not the narrator
+        before = next(ln for ln in lines if ln["text"].startswith("Квадрат"))
+        self.assertEqual(before["pause_after_ms"], orchestrate.GAPS_MS["attribution"])
+
     def test_merge_breaths_from_prose(self):
         lines = [
             "Земля содрогалась, словно в предсмертных судорогах.",
@@ -376,6 +476,59 @@ class KaggleTest(BookFixture):
         lex = {"кобуры": "кобуры\u0301", "АК-74": "а-ка семьдесят четыре"}
         self.assertEqual(render_chapter.apply_lexicon("Кобуры и АК-74, кобуры.", lex),
                          "Кобуры\u0301 и а-ка семьдесят четыре, кобуры\u0301.")
+
+    def test_cast_designs_characters_and_emotions(self):
+        cast = os.path.join(self.tmp, "cast.json")
+        with open(cast, "w", encoding="utf-8") as f:
+            json.dump({"characters": {
+                "Андрей": {"description": "male, 30, low husky voice"},
+                "Милонега": {"description": "female, calm healer", "emotions": ["whisper"]},
+                "Диктор": {"voice": "Диктор", "description": "mature male narrator", "emotions": ["tense"]},
+            }}, f, ensure_ascii=False)
+        with open(self.voices, encoding="utf-8") as f:
+            data = json.load(f)
+        data["Диктор"]["speed"] = 1.25
+        with open(self.voices, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        out = os.path.join(self.tmp, "cast")
+        rc = orchestrate.main(["cast", cast, "--out", out, "--voices", self.voices,
+                               "--design-engine", "dummy", "--backend", "local", "--takes", "2"])
+        self.assertEqual(rc, 0)
+        voices = orchestrate.load_voices(self.voices)
+        for name in ["Андрей", "Андрей:tense", "Андрей:shout", "Андрей:whisper", "Андрей:sad",
+                     "Милонега", "Милонега:whisper", "Диктор:tense"]:
+            self.assertIn(name, voices)
+            self.assertTrue(os.path.exists(voices[name]["ref_audio"]), name)
+        self.assertNotIn("Милонега:shout", voices)
+        self.assertNotIn("Диктор:shout", voices)
+        self.assertEqual(voices["Диктор:tense"]["speed"], 1.25)  # inherits the narrator's speed
+        self.assertEqual(voices["Диктор"]["ref_audio"], os.path.join(self.tmp, "v0.wav"))  # untouched
+        self.assertEqual(voices["Андрей:shout"]["ref_text"], orchestrate.DEFAULT_EMOTIONS["shout"]["text"])
+        with open(os.path.join(out, "cast_report.json"), encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual(len(report["Андрей"]["emotions"]["shout"]["takes"]), 2)
+        self.assertTrue(os.path.exists(os.path.join(out, "cast", "Андрей", "takes", "shout_2.wav")))
+
+    def test_pick_closest_prefers_clean_takes(self):
+        import numpy as np
+        timbre = np.array([1.0, 0.0])
+        takes = [{"emb": np.array([1.0, 0.0]), "ok": False}, {"emb": np.array([0.7, 0.7]), "ok": True}]
+        self.assertIs(render_chapter.pick_closest(takes, timbre), takes[1])
+        takes = [{"emb": np.array([1.0, 0.0]), "ok": True}, {"emb": np.array([0.9, 0.1]), "ok": True},
+                 {"emb": np.array([0.0, 1.0]), "ok": True}]
+        self.assertIs(render_chapter.pick_typical(takes), takes[1])
+
+    def test_emotion_tag_picks_cast_voice(self):
+        script = "# Глава\n[voice:Андрей] [emotion shout] [volume 0.55] — Огонь!\n[emotion whisper] Тихо.\n"
+        chapters = orchestrate.parse_book(script)
+        voices = {"Андрей": {}, "Андрей:shout": {}}
+        orchestrate.resolve_emotions(chapters, voices)
+        lines = chapters[0]["lines"]
+        self.assertEqual(lines[0]["voice"], "Андрей:shout")
+        self.assertNotIn("volume", lines[0])  # the shout reference carries its loudness
+        self.assertEqual(lines[1]["voice"], "Андрей")  # no whisper reference: calm voice
+        self.assertEqual(orchestrate.qwen_delivery("Very loud commanding shout"), "[emotion shout] [speed 1.08]")
+        self.assertTrue(orchestrate.qwen_delivery("Whispering, incredibly slow").startswith("[emotion whisper]"))
 
     def test_reference_mismatch(self):
         text = "Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопье́сы."
