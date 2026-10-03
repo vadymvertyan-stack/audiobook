@@ -758,6 +758,8 @@ def convert_qwen_scenes(src_dir: str, voice: str, prose_dir: Optional[str] = Non
             spans, pauses = align_to_prose([t for t, _ in blocks], prose)
             for it, span, pause in zip(items, spans, pauses):
                 it["span"], it["pause"] = span, pause
+            if items and items[0]["pause"] is None and re.match(r"(?i)глава|розділ|часть|частина", items[0]["text"]):
+                items[0]["pause"] = GAPS_MS["paragraph"]  # the spoken heading
             items = merge_breaths(items, prose)
         out.append(f"# Глава {ch:02d}, сцена {sc}")
         out.append(f"[voice:{voice}]")
