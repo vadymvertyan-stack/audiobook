@@ -236,8 +236,87 @@ def chapter_dir_name(ch: Dict[str, Any]) -> str:
     return f"{ch['index']:02d}_{slug(ch['title'])}"
 
 
+# ---------------------------------------------------------------------------
+# Pauses between lines
+# ---------------------------------------------------------------------------
+
+GAPS_MS = {
+    "continue": 220,    # the next line finishes the same sentence
+    "line": 550,        # after a full stop
+    "question": 650,    # after ? or !
+    "ellipsis": 800,    # after …
+    "dialogue": 1000,   # into and out of a character's speech
+    "speaker_change": 650,
+    "paragraph": 1200,
+}
+
+_CLOSERS = "\"»”)' "
+_SPEECH_OPEN = ("—", "–", "«", "\"", "„")
+# "…огнем! — прохрипел Андрей": a dash followed by a verb of speaking.
+SPEECH_VERB = re.compile(
+    r"[,!?.…»\"]\s*[—–-]\s*(?:\w+\s+){0,2}?"
+    r"(?:про|вы|за|от|пере|до|при|вс|у)?"
+    r"(?:хрип|шепт|шепн|крикн|крич|сказ|ответ|спрос|бросил|выдохн|выдох|рявкн|рыч|произн|"
+    r"повтор|добав|воскликн|ор|заор|буркн|бормот|прохрип|стон|прошипел|шипел|рявк|окликн|позвал)",
+    re.IGNORECASE)
+# A capitalised gerund or "который" after a full stop still continues the
+# sentence ("…в костях." / "Превратившись в корку…"). Gerunds in -я/-а are
+# left out: they look too much like nouns and adjectives ("Земля", "Тяжелая").
+_GERUND_START = re.compile(r"^(?:[А-ЯЁ][а-яё]+(?:вшись|вши|вшие|ясь|аясь)|Котор(?:ый|ая|ое|ые|ого|ой|ую|ым|ых))\b")
+
+
+def speech_flags(texts: List[str]) -> List[bool]:
+    """True for lines that are (part of) a character's direct speech."""
+    flags = [t.lstrip().startswith(_SPEECH_OPEN) or bool(SPEECH_VERB.search(t)) for t in texts]
+    # "Пятьдесят третий, я Скиф!" / "Квадрат накрыт! — прохрипел Андрей":
+    # exclamations right before an attributed line belong to the same speech.
+    for i in range(len(texts) - 1, 0, -1):
+        if flags[i] and SPEECH_VERB.search(texts[i]):
+            j = i - 1
+            while j >= 0 and j >= i - 2 and texts[j].rstrip(_CLOSERS)[-1:] in "!?" and not flags[j]:
+                flags[j] = True
+                j -= 1
+    return flags
+
+
+def gap_between(cur: str, nxt: str, cur_speech: bool, nxt_speech: bool, gaps: Dict[str, int]) -> int:
+    end = cur.rstrip(_CLOSERS)[-1:] if cur.strip() else ""
+    first = nxt.lstrip(" —–-«\"„")[:1]
+    if cur_speech != nxt_speech:
+        return gaps["dialogue"]
+    runs_on = end in (",", ";", ":", "—", "–", "-") or end.isalnum()
+    if runs_on or (first.islower() and end not in ".!?") or (end in ".…" and _GERUND_START.match(nxt.lstrip())):
+        return gaps["continue"]
+    if end == "…" or cur.rstrip(_CLOSERS).endswith("..."):
+        return gaps["ellipsis"]
+    if end in "?!":
+        return gaps["question"]
+    return gaps["line"]
+
+
+def assign_gaps(lines: List[Dict[str, Any]], gaps: Optional[Dict[str, int]] = None) -> None:
+    """Fill pause_after_ms for every line that has no explicit [pause]."""
+    g = dict(GAPS_MS, **(gaps or {}))
+    texts = [ln["text"] for ln in lines]
+    speech = speech_flags(texts)
+    for i, ln in enumerate(lines):
+        if ln.get("pause_after_ms") is not None:
+            continue
+        if i == len(lines) - 1:
+            ln["pause_after_ms"] = 0
+        elif ln.get("paragraph_end"):
+            ln["pause_after_ms"] = g["paragraph"]
+        else:
+            gap = gap_between(texts[i], texts[i + 1], speech[i], speech[i + 1], g)
+            if lines[i + 1]["voice"] != ln["voice"]:
+                gap = max(gap, g["speaker_change"])
+            ln["pause_after_ms"] = gap
+
+
 def build_job(ch: Dict[str, Any], voices: Dict[str, Dict[str, Any]], settings: Dict[str, Any], zip_path: str) -> str:
-    used = sorted({ln["voice"] for ln in ch["lines"]})
+    lines = [dict(ln) for ln in ch["lines"]]
+    assign_gaps(lines, settings.get("gap_ms"))
+    used = sorted({ln["voice"] for ln in lines})
     job_voices = {}
     files = {}
     for i, name in enumerate(used):
@@ -262,7 +341,7 @@ def build_job(ch: Dict[str, Any], voices: Dict[str, Dict[str, Any]], settings: D
         "lexicon": settings.get("lexicon", {}),
         "gap_ms": settings.get("gap_ms", {}),
         "voices": job_voices,
-        "lines": ch["lines"],
+        "lines": lines,
     }
     job["job_id"] = hashlib.sha256(json.dumps(job, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -553,6 +632,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
     chapters, voices = load_book(args)
     problems = check_voices(chapters, voices)
     chars = sum(len(ln["text"]) for c in chapters for ln in c["lines"])
+    if args.gaps:
+        for c in chapters:
+            lines = [dict(ln) for ln in c["lines"]]
+            assign_gaps(lines)
+            for ln in lines:
+                print(f"{c['index']:>3} {ln['id']} {ln['pause_after_ms']:>5}  {ln['text'][:70]}")
     emit({
         "ok": not problems,
         "problems": problems,
@@ -563,8 +648,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
             for c in chapters
         ],
         "total_chars": chars,
-        # ~14 characters per second of narration; a rough figure for planning only.
-        "estimated_audio_minutes": round(chars / 14 / 60, 1),
+        # ~11 characters per second (measured with OmniVoice on Russian prose),
+        # plus the pauses; a rough figure for planning only.
+        "estimated_audio_minutes": round(chars / 11 / 60, 1),
     })
     return 0 if not problems else 2
 
@@ -849,6 +935,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("plan", help="validate script and voices, no GPU")
     book_args(sp)
+    sp.add_argument("--gaps", action="store_true", help="also list each line with its pause after it")
     sp.set_defaults(func=cmd_plan)
 
     sp = sub.add_parser("render", help="render chapters on a Colab GPU")

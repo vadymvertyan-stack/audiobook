@@ -156,7 +156,7 @@ class PipelineTest(BookFixture):
             manifest = json.load(f)
         self.assertEqual(len(manifest["lines"]), 4)
         self.assertEqual(manifest["lines"][1]["gap_after_ms"], 1500)
-        gaps = render_chapter.DEFAULT_GAPS_MS
+        gaps = orchestrate.GAPS_MS
         self.assertEqual(manifest["lines"][2]["gap_after_ms"], gaps["paragraph"])
         self.assertEqual(manifest["lines"][0]["gap_after_ms"], gaps["dialogue"])  # narrator -> speech
         self.assertEqual({ln["seed"] for ln in manifest["lines"] if ln["voice"] == "Диктор"}, {100})
@@ -251,16 +251,30 @@ class KaggleTest(BookFixture):
         self.assertEqual(sorted(j for j in jobs if j.startswith("job_")), ["job_002.job"])
 
     def test_gaps_follow_punctuation_and_speech(self):
-        g = render_chapter.DEFAULT_GAPS_MS
-        gap = render_chapter.gap_between
-        self.assertEqual(gap("Его камуфляж,", "превратившись в корку.", g), g["continue"])
-        self.assertEqual(gap("Земля содрогалась.", "Над окопами висел дым.", g), g["line"])
-        self.assertEqual(gap("Ты слышишь?", "Тишина.", g), g["question"])
-        self.assertEqual(gap("Он замолчал…", "Тишина.", g), g["ellipsis"])
-        self.assertEqual(gap("Андрей поднял рацию.", "— Пятьдесят третий, я Скиф!", g), g["dialogue"])
-        self.assertEqual(gap("— Огонь!", "Он упал.", g), g["dialogue"])
-        # A sentence that runs on into speech still gets the speech pause.
-        self.assertEqual(gap("Он крикнул:", "— Ложись!", g), g["dialogue"])
+        # Real lines from the first scene of the test play.
+        lines = [{"voice": "Д", "text": t} for t in [
+            "Земля содрогалась, словно в предсмертных судорогах.",            # 0
+            "Удар пришелся совсем рядом, отдаваясь тупой болью в костях.",   # 1
+            "Превратившись в сплошную корку из грязи.",                      # 2 continues 1
+            "Его камуфляж был покрыт пылью, стирая рисунок...",              # 3
+            "Пятьдесят третий, я Скиф!",                                      # 4 speech
+            "Квадрат семь ноль два накрыт плотным огнем! — прохрипел Андрей в тангенту.",  # 5 speech
+            "Ответа не было.",                                               # 6
+            "Ты слышишь?",                                                    # 7
+            "— Ложись!",                                                      # 8 speech
+        ]]
+        orchestrate.assign_gaps(lines)
+        g = orchestrate.GAPS_MS
+        got = [ln["pause_after_ms"] for ln in lines]
+        self.assertEqual(got, [g["line"], g["continue"], g["line"], g["dialogue"], g["question"],
+                               g["dialogue"], g["line"], g["dialogue"], 0])
+
+    def test_explicit_pause_and_paragraph_win(self):
+        lines = [{"voice": "Д", "text": "Раз.", "pause_after_ms": 2000},
+                 {"voice": "Д", "text": "Два.", "paragraph_end": True},
+                 {"voice": "М", "text": "Три."}]
+        orchestrate.assign_gaps(lines)
+        self.assertEqual([ln["pause_after_ms"] for ln in lines], [2000, orchestrate.GAPS_MS["paragraph"], 0])
 
     def test_import_qwen_keeps_tempo_and_volume(self):
         src = os.path.join(self.tmp, "qwen2")

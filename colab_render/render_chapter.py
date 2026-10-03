@@ -246,39 +246,8 @@ class DummyEngine:
         return (tone + 0.005 * rng.standard_normal(t.size)).astype(np.float32)
 
 
-DEFAULT_GAPS_MS = {
-    "continue": 220,    # the next line finishes the same sentence
-    "line": 550,        # after a full stop
-    "question": 650,    # after ? or !
-    "ellipsis": 800,    # after …
-    "dialogue": 950,    # before and after a character's direct speech
-    "speaker_change": 400,
-    "paragraph": 1100,
-}
-
-_CLOSERS = "\"»”)' "
-
-
-def _is_speech(text: str) -> bool:
-    t = text.lstrip()
-    return t.startswith(("—", "–", "-", "«", "\"", "„"))
-
-
-def gap_between(cur: str, nxt: str, gaps: Dict[str, int]) -> int:
-    """Pause after `cur` from punctuation: short when `nxt` continues the
-    sentence, longer after ? ! and …, longest around direct speech."""
-    end = cur.rstrip(_CLOSERS)[-1:] if cur.strip() else ""
-    first = nxt.lstrip(" —–-«\"„")[:1]
-    continues = end in (",", ";", ":", "—", "–", "-") or end.isalnum() or (first.islower() and end != "…")
-    if continues and not _is_speech(nxt):
-        return gaps["continue"]
-    if _is_speech(cur) != _is_speech(nxt) or (_is_speech(nxt) and end in ".!?…"):
-        return gaps["dialogue"]
-    if end == "…" or cur.rstrip(_CLOSERS).endswith("..."):
-        return gaps["ellipsis"]
-    if end in "?!":
-        return gaps["question"]
-    return gaps["line"]
+# Fallback only: orchestrate.py normally sends every line's pause.
+DEFAULT_GAPS_MS = {"line": 550, "speaker_change": 650, "paragraph": 1100}
 
 
 def _words(text: str) -> List[str]:
@@ -523,9 +492,9 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
         elif m["paragraph_end"]:
             gap = gaps["paragraph"]
         elif manifest_lines[i + 1]["voice"] != m["voice"]:
-            gap = max(gaps["speaker_change"], gap_between(m["text"], manifest_lines[i + 1]["text"], gaps))
+            gap = gaps["speaker_change"]
         else:
-            gap = gap_between(m["text"], manifest_lines[i + 1]["text"], gaps)
+            gap = gaps["line"]
         m["gap_after_ms"] = gap
         cursor += int(sr * gap / 1000)
     total = cursor
