@@ -825,7 +825,11 @@ def cmd_render(args: argparse.Namespace) -> int:
     chapters, voices = load_book(args)
     problems = check_voices(chapters, voices)
     if args.backend == "kaggle" and not Kaggle.username(args.kaggle_user, args.kaggle_bin):
-        problems.append("Kaggle account unknown: run `kaggle auth login` or pass --kaggle-user")
+        binary = args.kaggle_bin or os.environ.get("KAGGLE_BIN", "kaggle")
+        if not shutil.which(binary):
+            problems.append(f"kaggle CLI not found on PATH ({binary}); add ~/.local/bin to PATH or pass --kaggle-bin")
+        else:
+            problems.append("Kaggle account unknown: run `kaggle auth login` or pass --kaggle-user")
     if problems:
         emit({"ok": False, "problems": problems})
         return 2
