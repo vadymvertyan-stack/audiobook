@@ -1512,8 +1512,8 @@ def cmd_cast(args: argparse.Namespace) -> int:
             note(f"added {len(info['voices'])} voice(s) to {args.voices}")
         collected.append(info)
         if args.publish:
-            err = publish(out_dir, args.publish, ["cast/*/*.wav", "cast_report.json"]
-                          + (["cast/*/takes/*.wav"] if args.publish_takes else []))
+            err = publish(out_dir, args.publish, ["/cast/*/*.wav", "/cast_report.json"]
+                          + (["/cast/*/takes/*.wav"] if args.publish_takes else []))
             if err:
                 note(f"WARNING: {err}")
         return {"summary": info["summary"], "between_characters": info["between_characters"],
