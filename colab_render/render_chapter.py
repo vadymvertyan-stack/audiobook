@@ -559,23 +559,25 @@ def run_batch(pattern: str, out_root: str, workdir: str, engine_override: Option
     import glob
     import traceback
 
-    # Kaggle unpacks .zip files in a dataset, so job_001.zip arrives as a
-    # job_001/ folder. Take both forms; a zip wins if both are present.
-    found = {}
-    for path in glob.glob(pattern, recursive=True):
-        found[os.path.basename(path)[:-4] if path.endswith(".zip") else os.path.basename(path)] = path
-    dir_pattern = pattern[:-4] if pattern.endswith(".zip") else pattern
-    for path in glob.glob(dir_pattern, recursive=True):
-        if os.path.isfile(os.path.join(path, "job.json")):
-            found.setdefault(os.path.basename(path.rstrip("/")), path)
+    # Jobs arrive as job_NNN.job (a zip under another name, so Kaggle leaves
+    # it alone), as job_NNN.zip, or as a job_NNN/ folder that Kaggle unpacked.
+    # A zip or .job wins over a folder with the same name.
+    if pattern.endswith(".zip"):
+        pattern = pattern[:-4]
+    found: Dict[str, str] = {}
+    for path in glob.glob(pattern + "*", recursive=True):
+        base = os.path.basename(path.rstrip("/"))
+        stem, ext = os.path.splitext(base)
+        if os.path.isfile(path) and ext in (".zip", ".job"):
+            found[stem] = path
+        elif os.path.isdir(path) and os.path.isfile(os.path.join(path, "job.json")):
+            found.setdefault(base, path)
     jobs = [found[k] for k in sorted(found)]
     log(f"batch: {len(jobs)} job(s) matching {pattern}")
     os.makedirs(out_root, exist_ok=True)
     report: List[Dict[str, Any]] = []
     for job in jobs:
-        name = os.path.basename(job.rstrip("/"))
-        if not name.endswith(".zip"):
-            name += ".zip"
+        name = os.path.splitext(os.path.basename(job.rstrip("/")))[0] + ".zip"
         out_name = "out_" + name[len("job_"):] if name.startswith("job_") else "out_" + name
         entry: Dict[str, Any] = {"job": name, "out": out_name}
         try:

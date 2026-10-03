@@ -247,7 +247,7 @@ class KaggleTest(BookFixture):
         os.remove(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "calls.log"))
         self.assertEqual(self.render_kaggle(), 0)
         jobs = os.listdir(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "datasets", "tester", "audiobook-jobs"))
-        self.assertEqual(sorted(j for j in jobs if j.startswith("job_")), ["job_002"])
+        self.assertEqual(sorted(j for j in jobs if j.startswith("job_")), ["job_002.job"])
 
     def test_reference_mismatch(self):
         text = "Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопье́сы."
@@ -268,6 +268,11 @@ class KaggleTest(BookFixture):
                 render_chapter._pip_install("omnivoice")
         finally:
             socket.getaddrinfo = real
+
+    def test_kaggle_single_chapter(self):
+        # A lone .zip would be unpacked into the dataset root and missed.
+        self.assertEqual(self.render_kaggle("--chapters", "2"), 0)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "02_Розділ_2_Ранок", "chapter.wav")))
 
     def test_kaggle_run_error_is_reported(self):
         os.environ["FAKE_KAGGLE_FAIL"] = "kernel"

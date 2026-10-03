@@ -50,12 +50,14 @@ def main():
             if os.path.isdir(dst):
                 shutil.rmtree(dst)
             shutil.copytree(src, dst)
-            # Like Kaggle: uploaded zips are unpacked into folders.
-            for name in os.listdir(dst):
-                if name.endswith(".zip"):
-                    with zipfile.ZipFile(os.path.join(dst, name)) as z:
-                        z.extractall(os.path.join(dst, name[:-4]))
-                    os.remove(os.path.join(dst, name))
+            # Like Kaggle: uploaded zips are unpacked into folders, and a
+            # lone zip straight into the dataset root.
+            zips = [n for n in os.listdir(dst) if n.endswith(".zip")]
+            for name in zips:
+                target = dst if len(zips) == 1 else os.path.join(dst, name[:-4])
+                with zipfile.ZipFile(os.path.join(dst, name)) as z:
+                    z.extractall(target)
+                os.remove(os.path.join(dst, name))
             # And a fresh dataset is briefly forbidden.
             with open(os.path.join(ROOT, "status_403"), "w") as f:
                 f.write("1")
@@ -74,11 +76,10 @@ def main():
             for ds in meta["dataset_sources"]:
                 shutil.copytree(os.path.join(ROOT, "datasets", ds), os.path.join(inputs, ds.split("/")[1]))
             if os.environ.get("FAKE_KAGGLE_FAIL") == "chapter2":
-                os.remove(os.path.join(inputs, ds.split("/")[1], "job_002", "job.json"))
-                with open(os.path.join(inputs, ds.split("/")[1], "job_002", "job.json"), "w") as f:
-                    f.write("not json")
+                with open(os.path.join(inputs, ds.split("/")[1], "job_002.job"), "w") as f:
+                    f.write("not a zip")
             env = dict(os.environ)
-            env["AUDIOBOOK_BATCH_GLOB"] = os.path.join(inputs, "**", "job_*.zip")
+            env["AUDIOBOOK_BATCH_GLOB"] = os.path.join(inputs, "**", "job_*")
             env["AUDIOBOOK_BATCH_OUT"] = working
             env["AUDIOBOOK_WORKDIR"] = os.path.join(ROOT, "tmp")
             env["AUDIOBOOK_ENGINE"] = "dummy"
