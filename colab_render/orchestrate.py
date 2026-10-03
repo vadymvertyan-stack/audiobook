@@ -61,6 +61,9 @@ DONE_MARKER = "AUDIOBOOK_RENDER_OK"  # printed by render_chapter.py on success
 
 VOICE_TAG = re.compile(r"\[voice:\s*([^\]]+?)\s*\]")
 PAUSE_TAG = re.compile(r"\[pause[\s:]*([\d.]+)\s*(ms|s)?\s*\]", re.IGNORECASE)
+# Per-line delivery, applies to the text on the same source line only.
+SPEED_TAG = re.compile(r"\[speed[\s:]*([\d.]+)\s*\]", re.IGNORECASE)
+VOLUME_TAG = re.compile(r"\[volume[\s:]*([\d.]+)\s*\]", re.IGNORECASE)
 SENTENCE_END = re.compile(r"(?<=[.!?…])[\"»”)]*\s+")
 
 
@@ -116,6 +119,12 @@ def parse_book(text: str, default_voice: Optional[str] = None) -> List[Dict[str,
             if current and current["lines"]:
                 current["lines"][-1]["paragraph_end"] = True
             continue
+        delivery: Dict[str, float] = {}
+        for tag, key in ((SPEED_TAG, "speed"), (VOLUME_TAG, "volume")):
+            m = tag.search(line)
+            if m:
+                delivery[key] = float(m.group(1))
+                line = tag.sub("", line).strip()
         # A line may hold several [voice:] / [pause] tags; walk them in order.
         pos = 0
         tokens = sorted(
@@ -146,7 +155,7 @@ def parse_book(text: str, default_voice: Optional[str] = None) -> List[Dict[str,
                 if not voice:
                     raise ValueError(f"text before any [voice:...] tag: {body[:60]!r}")
                 for piece in split_long(body):
-                    ch["lines"].append({"voice": voice, "text": piece})
+                    ch["lines"].append({"voice": voice, "text": piece, **delivery})
     chapters = [c for c in chapters if c["lines"]]
     for n, c in enumerate(chapters, 1):
         c["index"] = n
@@ -476,14 +485,37 @@ def load_book(args: argparse.Namespace):
 
 
 QWEN_SCENE_FILE = re.compile(r"chapter_(\d+)_scene(\d+)\.md$")
-QWEN_TEXT = re.compile(r"^Text:\s*(.*)$", re.M)
+QWEN_BLOCK = re.compile(r"^Text:\s*(.*?)\s*$(?:\s*^System_Prompt:\s*(.*?)\s*$)?", re.M)
+
+# System_Prompt words -> what the cloned voice can still change: tempo and
+# loudness. OmniVoice copies the reference's emotion and ignores the words.
+QWEN_SPEED = [
+    (re.compile(r"\b(incredibly|extremely|very) slow", re.I), 0.82),
+    (re.compile(r"\b(slow|slowly|slower|drawn[- ]out|deliberate|fading)\b", re.I), 0.9),
+    (re.compile(r"\b(very fast|rapid|rushed|frantic|panick?ed|breathless)\b", re.I), 1.15),
+    (re.compile(r"\b(fast|quick|quickly|urgent|hurried|tense)\b", re.I), 1.08),
+]
+QWEN_VOLUME = [
+    (re.compile(r"\b(whisper|whispering|whispered|barely audible)\b", re.I), 0.55),
+    (re.compile(r"\b(quiet|quietly|soft|softly|hushed|muted)\b", re.I), 0.72),
+]
+
+
+def qwen_delivery(prompt: str) -> str:
+    tags = []
+    for table, name in ((QWEN_SPEED, "speed"), (QWEN_VOLUME, "volume")):
+        for rx, value in table:
+            if rx.search(prompt or ""):
+                tags.append(f"[{name} {value}]")
+                break
+    return " ".join(tags)
 
 
 def convert_qwen_scenes(src_dir: str, voice: str) -> str:
     """Old Audio_Ready_Qwen exports: one file per scene, blocks of ID / Text /
     System_Prompt separated by '---'. Each scene becomes one chapter of the
-    script, so a test can render a single scene. System_Prompt is dropped:
-    the cloned voice carries the tone now."""
+    script, so a test can render a single scene. System_Prompt becomes
+    [speed]/[volume] tags; the emotion itself comes from the reference."""
     files = []
     for name in os.listdir(src_dir):
         m = QWEN_SCENE_FILE.search(name)
@@ -493,12 +525,15 @@ def convert_qwen_scenes(src_dir: str, voice: str) -> str:
         raise FileNotFoundError(f"no *chapter_NN_sceneK.md files in {src_dir}")
     out = []
     for ch, sc, name in sorted(files):
-        texts = [t.strip() for t in QWEN_TEXT.findall(read_text(os.path.join(src_dir, name)) or "") if t.strip()]
-        if not texts:
+        blocks = [(t.strip(), p) for t, p in QWEN_BLOCK.findall(read_text(os.path.join(src_dir, name)) or "")
+                  if t.strip()]
+        if not blocks:
             continue
         out.append(f"# Глава {ch:02d}, сцена {sc}")
         out.append(f"[voice:{voice}]")
-        out.extend(texts)
+        for text, prompt in blocks:
+            tags = qwen_delivery(prompt)
+            out.append(f"{tags} {text}" if tags else text)
         out.append("")
     return "\n".join(out)
 

@@ -156,8 +156,9 @@ class PipelineTest(BookFixture):
             manifest = json.load(f)
         self.assertEqual(len(manifest["lines"]), 4)
         self.assertEqual(manifest["lines"][1]["gap_after_ms"], 1500)
-        self.assertEqual(manifest["lines"][2]["gap_after_ms"], 700)  # paragraph
-        self.assertEqual(manifest["lines"][0]["gap_after_ms"], 400)  # speaker change
+        gaps = render_chapter.DEFAULT_GAPS_MS
+        self.assertEqual(manifest["lines"][2]["gap_after_ms"], gaps["paragraph"])
+        self.assertEqual(manifest["lines"][0]["gap_after_ms"], gaps["dialogue"])  # narrator -> speech
         self.assertEqual({ln["seed"] for ln in manifest["lines"] if ln["voice"] == "Диктор"}, {100})
         with wave.open(os.path.join(ch1, "chapter.wav")) as w:
             chapter_frames = w.getnframes()
@@ -248,6 +249,29 @@ class KaggleTest(BookFixture):
         self.assertEqual(self.render_kaggle(), 0)
         jobs = os.listdir(os.path.join(os.environ["FAKE_KAGGLE_ROOT"], "datasets", "tester", "audiobook-jobs"))
         self.assertEqual(sorted(j for j in jobs if j.startswith("job_")), ["job_002.job"])
+
+    def test_gaps_follow_punctuation_and_speech(self):
+        g = render_chapter.DEFAULT_GAPS_MS
+        gap = render_chapter.gap_between
+        self.assertEqual(gap("Его камуфляж,", "превратившись в корку.", g), g["continue"])
+        self.assertEqual(gap("Земля содрогалась.", "Над окопами висел дым.", g), g["line"])
+        self.assertEqual(gap("Ты слышишь?", "Тишина.", g), g["question"])
+        self.assertEqual(gap("Он замолчал…", "Тишина.", g), g["ellipsis"])
+        self.assertEqual(gap("Андрей поднял рацию.", "— Пятьдесят третий, я Скиф!", g), g["dialogue"])
+        self.assertEqual(gap("— Огонь!", "Он упал.", g), g["dialogue"])
+        # A sentence that runs on into speech still gets the speech pause.
+        self.assertEqual(gap("Он крикнул:", "— Ложись!", g), g["dialogue"])
+
+    def test_import_qwen_keeps_tempo_and_volume(self):
+        src = os.path.join(self.tmp, "qwen2")
+        os.makedirs(src)
+        with open(os.path.join(src, "vol1_chapter_01_scene1.md"), "w", encoding="utf-8") as f:
+            f.write("ID: 0001\nText: Тихо.\nSystem_Prompt: Whispering, incredibly slow, fading to silence\n---\n"
+                    "ID: 0002\nText: — Огонь!\nSystem_Prompt: Very loud commanding shout\n---\n"
+                    "ID: 0003\nText: Бежим.\nSystem_Prompt: Fast, urgent\n")
+        lines = orchestrate.parse_book(orchestrate.convert_qwen_scenes(src, "Диктор"))[0]["lines"]
+        self.assertEqual([(ln["text"], ln.get("speed"), ln.get("volume")) for ln in lines],
+                         [("Тихо.", 0.82, 0.55), ("— Огонь!", None, None), ("Бежим.", 1.08, None)])
 
     def test_reference_mismatch(self):
         text = "Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопье́сы."

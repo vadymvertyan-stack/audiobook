@@ -246,6 +246,41 @@ class DummyEngine:
         return (tone + 0.005 * rng.standard_normal(t.size)).astype(np.float32)
 
 
+DEFAULT_GAPS_MS = {
+    "continue": 220,    # the next line finishes the same sentence
+    "line": 550,        # after a full stop
+    "question": 650,    # after ? or !
+    "ellipsis": 800,    # after …
+    "dialogue": 950,    # before and after a character's direct speech
+    "speaker_change": 400,
+    "paragraph": 1100,
+}
+
+_CLOSERS = "\"»”)' "
+
+
+def _is_speech(text: str) -> bool:
+    t = text.lstrip()
+    return t.startswith(("—", "–", "-", "«", "\"", "„"))
+
+
+def gap_between(cur: str, nxt: str, gaps: Dict[str, int]) -> int:
+    """Pause after `cur` from punctuation: short when `nxt` continues the
+    sentence, longer after ? ! and …, longest around direct speech."""
+    end = cur.rstrip(_CLOSERS)[-1:] if cur.strip() else ""
+    first = nxt.lstrip(" —–-«\"„")[:1]
+    continues = end in (",", ";", ":", "—", "–", "-") or end.isalnum() or (first.islower() and end != "…")
+    if continues and not _is_speech(nxt):
+        return gaps["continue"]
+    if _is_speech(cur) != _is_speech(nxt) or (_is_speech(nxt) and end in ".!?…"):
+        return gaps["dialogue"]
+    if end == "…" or cur.rstrip(_CLOSERS).endswith("..."):
+        return gaps["ellipsis"]
+    if end in "?!":
+        return gaps["question"]
+    return gaps["line"]
+
+
 def _words(text: str) -> List[str]:
     text = unicodedata.normalize("NFD", text.lower().replace("ё", "е"))
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
@@ -400,7 +435,7 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
     language = job.get("language", "")
     stress_mode = job.get("stress_mode", "strip")
     lexicon = job.get("lexicon", {}) or {}
-    gaps = {"line": 250, "speaker_change": 400, "paragraph": 700}
+    gaps = dict(DEFAULT_GAPS_MS)
     gaps.update(job.get("gap_ms", {}) or {})
     voices: Dict[str, Dict[str, Any]] = job["voices"]
     lines: List[Dict[str, Any]] = job["lines"]
@@ -432,10 +467,11 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
     started = time.time()
     for idx, ln in enumerate(lines, 1):
         voice = voices[ln["voice"]]
-        speed = float(ln.get("speed") or voice.get("speed") or 1.0)
+        speed = float(voice.get("speed") or 1.0) * float(ln.get("speed") or 1.0)
+        volume = float(ln.get("volume") or 1.0)
         seed = int(voice.get("seed", 1234))
         text = apply_stress_mode(apply_lexicon(ln["text"], lexicon), stress_mode)
-        key = line_cache_key(engine_name, language, voice, text, speed, seed)
+        key = line_cache_key(engine_name, language, voice, text, speed, seed) + (f"|v{volume}" if volume != 1.0 else "")
         path = os.path.join(lines_dir, f"{ln['id']}.wav")
         key_path = path + ".key"
         reused = False
@@ -446,6 +482,7 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
             audio = engine.synth(text, prompts[ln["voice"]], voice, language, speed, seed)
             native_sr = int(getattr(engine, "sample_rate", sr))
             audio = trim_silence(resample_linear(audio, native_sr, sr), sr)
+            audio = audio * volume
             peak = float(np.max(np.abs(audio))) if audio.size else 0.0
             if peak > 0.99:
                 audio = audio * (0.99 / peak)
@@ -459,6 +496,7 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
                 "text": ln["text"],
                 "tts_text": text,
                 "speed": speed,
+                "volume": volume,
                 "seed": seed,
                 "samples": int(audio.size),
                 "seconds": round(audio.size / sr, 3),
@@ -485,9 +523,9 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
         elif m["paragraph_end"]:
             gap = gaps["paragraph"]
         elif manifest_lines[i + 1]["voice"] != m["voice"]:
-            gap = gaps["speaker_change"]
+            gap = max(gaps["speaker_change"], gap_between(m["text"], manifest_lines[i + 1]["text"], gaps))
         else:
-            gap = gaps["line"]
+            gap = gap_between(m["text"], manifest_lines[i + 1]["text"], gaps)
         m["gap_after_ms"] = gap
         cursor += int(sr * gap / 1000)
     total = cursor
