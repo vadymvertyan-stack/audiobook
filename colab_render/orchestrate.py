@@ -368,6 +368,7 @@ def build_job(ch: Dict[str, Any], voices: Dict[str, Dict[str, Any]], settings: D
         "voices": job_voices,
         "lines": lines,
         **({"vc_lines": vc_lines} if vc_lines != "none" else {}),
+        **({"max_synth_chars": settings["max_synth_chars"]} if settings.get("max_synth_chars") is not None else {}),
     }
     job["job_id"] = hashlib.sha256(json.dumps(job, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -586,6 +587,7 @@ def load_settings(args: argparse.Namespace) -> Dict[str, Any]:
         "stress": args.stress,
         "lexicon": lexicon,
         "vc_lines": getattr(args, "vc_lines", "none"),
+        "max_synth_chars": getattr(args, "max_synth_chars", None),
     }
 
 
@@ -1675,6 +1677,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--vc-lines", default="none", choices=["none", "seed-vc", "dummy"],
                     help="convert every emotion line ('Name:tense', ...) to the calm voice's timbre after "
                          "synthesis, so a character never sounds like a second person")
+    sp.add_argument("--max-synth-chars", type=int, default=None,
+                    help="synthesise lines longer than this in pieces (default 170; 0 = never split)")
     sp.add_argument("--gpu", default="L4", help="T4, L4, A100, H100 or '' for CPU")
     sp.add_argument("--session", default=None, help="Colab session name")
     sp.add_argument("--keep", action="store_true", help="leave the session running afterwards (it keeps billing)")

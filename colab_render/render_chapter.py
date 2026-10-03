@@ -597,7 +597,7 @@ def render_job(job_dir: str, out_dir: str, engine_override: Optional[str] = None
     engine = get_engine(engine_name, dict(job.get("engine_options", {}) or {}))
     sr = int(engine.sample_rate)
 
-    max_chars = int(job.get("max_synth_chars") or MAX_SYNTH_CHARS)
+    max_chars = int(job["max_synth_chars"]) if job.get("max_synth_chars") is not None else MAX_SYNTH_CHARS
     vc = get_vc(job.get("vc_lines", "none"), dict(job.get("vc_options", {}) or {}))
     vc_work = os.path.join(out_dir, "vc_work")
 
