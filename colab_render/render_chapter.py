@@ -726,7 +726,10 @@ class SeedVC:
     its own venv on top of the system torch and runs as a subprocess."""
 
     REPO = "https://github.com/Plachtaa/seed-vc"
-    SKIP = re.compile(r"^(-|torch|torchvision|torchaudio)|gradio|FreeSimpleGUI|sounddevice", re.I)
+    # torch from the system; GUI, ASR-training and eval extras aren't used by
+    # inference.py; protobuf must stay the system one (see _drop_shadowing).
+    SKIP = re.compile(r"^(-|torch|torchvision|torchaudio)|gradio|FreeSimpleGUI|sounddevice|funasr|modelscope"
+                      r"|resemblyzer|jiwer|protobuf", re.I)
 
     def __init__(self, options: Optional[Dict[str, Any]] = None):
         options = options or {}
@@ -736,8 +739,10 @@ class SeedVC:
         self.cfg = float(options.get("vc_cfg", 0.7))
         self.repo = options.get("vc_dir") or os.path.join(tempfile.gettempdir(), "seed-vc")
         self.python = os.path.join(self.repo, ".venv", "bin", "python")
-        if os.path.exists(self.python):
+        ready = os.path.join(self.repo, ".venv", "ready")
+        if os.path.exists(ready):
             return
+        shutil.rmtree(os.path.join(self.repo, ".venv"), ignore_errors=True)
         _pip_install()  # only checks for internet
         if not os.path.isdir(os.path.join(self.repo, ".git")):
             log("cloning Seed-VC")
@@ -754,6 +759,25 @@ class SeedVC:
             f.write("\n".join(reqs) + "\n")
         log(f"installing Seed-VC requirements ({len(reqs)} packages, system torch kept)")
         subprocess.run([self.python, "-m", "pip", "install", "-q", "-r", req], check=True)
+        self._drop_shadowing()
+        res = subprocess.run([self.python, "-c", "from transformers import AutoFeatureExtractor, WhisperModel; "
+                              "import dac, munch, hydra, librosa, torch; print(torch.__version__)"],
+                             cwd=self.repo, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Seed-VC environment is broken: {(res.stderr or res.stdout)[-1500:]}")
+        open(ready, "w").close()
+
+    def _drop_shadowing(self) -> None:
+        """A dependency can drag an old protobuf into the venv, which then hides
+        the system one that Kaggle's compiled *_pb2 modules need
+        ("cannot import name 'runtime_version'"). Remove only the venv copy."""
+        import glob
+
+        for site in glob.glob(os.path.join(self.repo, ".venv", "lib", "python*", "site-packages")):
+            for path in [os.path.join(site, "google", "protobuf")] + glob.glob(os.path.join(site, "protobuf-*")):
+                if os.path.exists(path):
+                    log(f"removing venv copy {os.path.basename(path)} (system protobuf is used)")
+                    shutil.rmtree(path, ignore_errors=True)
 
     def convert(self, source: str, target: str, workdir: str) -> Tuple[np.ndarray, int]:
         import glob
