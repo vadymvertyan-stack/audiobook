@@ -1067,6 +1067,23 @@ def finish_chapter(ch: Dict[str, Any], ch_dir: str, out_zip: str, job_id: str, s
     return info
 
 
+def publish(local_dir: str, remote: str, includes: List[str], binary: Optional[str] = None) -> Optional[str]:
+    """Copy finished files to cloud storage with rclone (e.g. remote 'gdrive:Audiobook/echo'),
+    so the user's PC does not have to hold them. Returns an error text, or None."""
+    rclone = binary or os.environ.get("RCLONE_BIN", "rclone")
+    cmd = [rclone, "copy", local_dir, remote]
+    for pattern in includes:
+        cmd += ["--include", pattern]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"rclone failed: {e}"
+    if res.returncode != 0:
+        return f"rclone failed: {(res.stderr or res.stdout)[-500:]}"
+    note(f"uploaded to {remote}")
+    return None
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     chapters, voices = load_book(args)
     problems = check_voices(chapters, voices)
@@ -1105,9 +1122,19 @@ def cmd_render(args: argparse.Namespace) -> int:
 
     os.makedirs(STATE_DIR, exist_ok=True)
     try:
+        def finish_and_publish(ch, ch_dir, out_zip, job_id, started):
+            info = finish_chapter(ch, ch_dir, out_zip, job_id, started)
+            err = publish(ch_dir, f"{args.publish.rstrip('/')}/{os.path.basename(ch_dir)}",
+                          ["*.mp3", "manifest.json"])
+            if err:
+                info["publish_error"] = err
+                note(f"WARNING: {err}")
+            return info
+
+        finish = finish_and_publish if args.publish else None
         if args.backend == "kaggle":
-            return _render_kaggle(args, todo)
-        return _render_colab(args, todo)
+            return _render_kaggle(args, todo, finish)
+        return _render_colab(args, todo, finish)
     finally:
         for _, _, tmp_zip, _ in todo:
             if os.path.exists(tmp_zip):
@@ -1420,6 +1447,11 @@ def cmd_cast(args: argparse.Namespace) -> int:
             merge_voices(args.voices, info["voices"])
             note(f"added {len(info['voices'])} voice(s) to {args.voices}")
         collected.append(info)
+        if args.publish:
+            err = publish(out_dir, args.publish, ["cast/*/*.wav", "cast_report.json"]
+                          + (["cast/*/takes/*.wav"] if args.publish_takes else []))
+            if err:
+                note(f"WARNING: {err}")
         return {"summary": info["summary"], "wall_seconds": info["wall_seconds"]}
 
     todo = [({"index": 1, "title": "cast", "lines": []}, args.out, tmp_zip, job_id)]
@@ -1538,6 +1570,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="NvidiaTeslaT4 (T4 x2) or NvidiaL4; avoid P100, current PyTorch no longer supports it")
     sp.add_argument("--kaggle-max-hours", type=int, default=11, help="Kaggle caps a run at 12 hours")
     sp.add_argument("--poll-seconds", type=float, default=60.0, help="how often to check Kaggle status")
+    sp.add_argument("--publish", default=None,
+                    help="rclone destination for each chapter's mp3, e.g. gdrive:Audiobook/echo")
     sp.set_defaults(func=cmd_render)
 
     sp = sub.add_parser("cast", help="design each character's voice and emotions (Qwen3-TTS VoiceDesign)")
@@ -1557,10 +1591,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--kaggle-bin", default=None)
     sp.add_argument("--kaggle-user", default=None)
     sp.add_argument("--kaggle-dataset", default="audiobook-cast")
-    sp.add_argument("--kaggle-kernel", default="audiobook-cast")
+    # A new kernel slug got 409 Conflict on push; reuse the render notebook.
+    sp.add_argument("--kaggle-kernel", default="audiobook-render")
     sp.add_argument("--kaggle-accelerator", default="NvidiaTeslaT4")
     sp.add_argument("--kaggle-max-hours", type=int, default=4)
     sp.add_argument("--poll-seconds", type=float, default=60.0)
+    sp.add_argument("--publish", default=None, help="rclone destination for the voices, e.g. gdrive:Audiobook/echo/cast")
+    sp.add_argument("--publish-takes", action="store_true", help="also upload every take, not just the chosen ones")
     sp.set_defaults(func=cmd_cast, book=None)
 
     sp = sub.add_parser("assemble", help="rebuild chapter.wav and stems from lines/")

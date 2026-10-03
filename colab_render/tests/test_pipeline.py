@@ -530,6 +530,22 @@ class KaggleTest(BookFixture):
         self.assertEqual(orchestrate.qwen_delivery("Very loud commanding shout"), "[emotion shout] [speed 1.08]")
         self.assertTrue(orchestrate.qwen_delivery("Whispering, incredibly slow").startswith("[emotion whisper]"))
 
+    def test_render_publishes_mp3_with_rclone(self):
+        log = os.path.join(self.tmp, "rclone.log")
+        fake = os.path.join(self.tmp, "rclone")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/sh\necho "$@" >> {log}\n')
+        os.chmod(fake, 0o755)
+        os.environ["RCLONE_BIN"] = fake
+        try:
+            self.assertEqual(self.render("--publish", "gdrive:Audiobook/test/"), 0)
+        finally:
+            os.environ.pop("RCLONE_BIN")
+        with open(log) as f:
+            calls = f.read().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("gdrive:Audiobook/test/01_Розділ_1_Ліс --include *.mp3", calls[0])
+
     def test_reference_mismatch(self):
         text = "Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопье́сы."
         self.assertIsNone(render_chapter.reference_mismatch(
