@@ -604,7 +604,10 @@ DESIGN_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 EMBED_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"  # only its speaker encoder is used
 ASR_MODEL = "openai/whisper-large-v3-turbo"
 LOW_SIMILARITY = 0.75
-TOO_ALIKE = 0.9  # two different characters this close in timbre are hard to tell apart
+# The speaker encoder's cosine saturates (~0.92 even for a man and a woman), so
+# "too alike" is judged against each character's own spread: two characters
+# closer than this margin below their within-character similarity are flagged.
+ALIKE_MARGIN = 0.012
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -938,12 +941,17 @@ def cast_voices(job_dir: str, out_dir: str) -> Dict[str, Any]:
 
     # Characters must also sound different from each other.
     names = [n for n in report if "calm_emb" in report[n]]
+    within = {}
+    for n in names:
+        sims = [e["chosen"]["similarity"] for e in report[n]["emotions"].values()
+                if (e.get("chosen") or {}).get("similarity") is not None and e["chosen"]["similarity"] < 0.9999]
+        within[n] = float(np.mean(sims)) if sims else 1.0
     pairs = {}
     for i, a in enumerate(names):
         for b in names[i + 1:]:
             sim = round(cosine(report[a]["calm_emb"], report[b]["calm_emb"]), 4)
             pairs[f"{a} / {b}"] = sim
-            if sim >= TOO_ALIKE:
+            if sim >= min(within[a], within[b]) - ALIKE_MARGIN:
                 log(f"cast '{a}' and '{b}' sound alike (similarity {sim:.2f}); make one description more distinct")
     for n in names:
         report[n].pop("calm_emb")

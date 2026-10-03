@@ -49,7 +49,7 @@ import unicodedata
 import time
 import wave
 import zipfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RENDER_SCRIPT = os.path.join(HERE, "render_chapter.py")
@@ -1497,11 +1497,13 @@ def finish_cast(ch: Dict[str, Any], out_dir: str, out_zip: str, job_id: str, sta
             "wall_seconds": round(time.time() - started, 1)}
 
 
-def merge_voices(path: str, new: Dict[str, Dict[str, Any]]) -> None:
+def merge_voices(path: str, new: Dict[str, Dict[str, Any]], remove: Iterable[str] = ()) -> None:
     data: Dict[str, Any] = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
+    for key in remove:
+        data.pop(key, None)
     data.update(new)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1543,13 +1545,18 @@ def cmd_cast(args: argparse.Namespace) -> int:
             base = voices.get(vname.split(":")[0])
             if base:
                 v["speed"], v["seed"] = base["speed"], base["seed"]
+        # An emotion this run dropped must not keep an older file of another timbre.
+        dropped = [k for k, v in info["summary"].items() if not v.get("file") and k not in info["voices"]]
         if args.voices:
-            merge_voices(args.voices, info["voices"])
-            note(f"added {len(info['voices'])} voice(s) to {args.voices}")
+            merge_voices(args.voices, info["voices"], dropped)
+            note(f"added {len(info['voices'])} voice(s) to {args.voices}"
+                 + (f", removed dropped {', '.join(dropped)}" if dropped else ""))
         collected.append(info)
         if args.publish:
-            err = publish(out_dir, args.publish, ["/cast/*/*.wav", "/cast_report.json"]
-                          + (["/cast/*/takes/*.wav"] if args.publish_takes else []))
+            # cast/<name>/... lands at <remote>/<name>/..., not <remote>/cast/<name>/.
+            err = publish(os.path.join(out_dir, "cast"), args.publish,
+                          ["/*/*.wav"] + (["/*/takes/*.wav"] if args.publish_takes else []))
+            err = err or publish(out_dir, args.publish, ["/cast_report.json"])
             if err:
                 note(f"WARNING: {err}")
         return {"summary": info["summary"], "between_characters": info["between_characters"],

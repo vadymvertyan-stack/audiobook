@@ -541,6 +541,14 @@ class KaggleTest(BookFixture):
         self.assertNotIn("calm", report2["Андрей"]["emotions"])  # calm is reused, not redesigned
         self.assertEqual(sorted(report2["Диктор"]["emotions"]), ["tense"])
 
+    def test_merge_voices_removes_dropped(self):
+        path = os.path.join(self.tmp, "mv.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"Милонега": {"a": 1}, "Милонега:tense": {"old": 1}}, f)
+        orchestrate.merge_voices(path, {"Милонега:sad": {"b": 2}}, ["Милонега:tense"])
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(sorted(json.load(f)), ["Милонега", "Милонега:sad"])
+
     def test_pick_closest_prefers_clean_takes(self):
         import numpy as np
         timbre = np.array([1.0, 0.0])
