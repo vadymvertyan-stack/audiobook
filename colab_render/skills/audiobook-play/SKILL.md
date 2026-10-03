@@ -16,7 +16,7 @@ P=/home/vadym/audiobook-data/books/<slug>/book.json      # e.g. books/echo/book.
 
 `audiobook.sh` runs the renderer as the user who owns it (vadym), where the
 Kaggle login and the Google Drive remote are, even when you run as root. Write
-commands below as `$A ...` .
+commands below as `$A ...`.
 
 Every command prints one JSON line at the end. `"ok": true` means it worked.
 On `"ok": false`, tell the user the `problems` or `error` text in one or two
