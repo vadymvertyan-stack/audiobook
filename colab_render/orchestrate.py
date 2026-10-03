@@ -571,9 +571,11 @@ QWEN_BLOCK = re.compile(r"^Text:\s*(.*?)\s*$(?:\s*^System_Prompt:\s*(.*?)\s*$)?"
 # loudness. OmniVoice copies the reference's emotion and ignores the words.
 QWEN_SPEED = [
     (re.compile(r"\b(incredibly|extremely|very) slow", re.I), 0.82),
-    (re.compile(r"\b(slow|slowly|slower|drawn[- ]out|deliberate|fading)\b", re.I), 0.9),
-    (re.compile(r"\b(very fast|rapid|rushed|frantic|panick?ed|breathless)\b", re.I), 1.15),
-    (re.compile(r"\b(fast|quick|quickly|urgent|hurried|tense)\b", re.I), 1.08),
+    (re.compile(r"\b(slow|slowly|slower|drawn[- ]out|deliberate|fading|sad|sorrow\w*|grief|"
+                r"mournful|crying|tearful|exhausted|weary|tired|dying|weak|solemn|reflective)\b", re.I), 0.9),
+    (re.compile(r"\b(very fast|rapid|rushed|frantic|panick?ed|breathless|terrified|hysterical)\b", re.I), 1.15),
+    (re.compile(r"\b(fast|quick|quickly|urgent|hurried|tense|shout\w*|yell\w*|scream\w*|"
+                r"commanding|barked|aggressive|angry|furious|excited|alarmed|intense|action)\b", re.I), 1.08),
 ]
 QWEN_VOLUME = [
     (re.compile(r"\b(whisper|whispering|whispered|barely audible)\b", re.I), 0.55),
@@ -630,6 +632,12 @@ def prose_pauses(lines: List[str], prose: str, gaps: Optional[Dict[str, int]] = 
     cut from: same sentence -> short, sentence end -> by its punctuation,
     paragraph -> long, into or out of direct speech -> dialogue. None where a
     line could not be found in the prose."""
+    return align_to_prose(lines, prose, gaps)[1]
+
+
+def align_to_prose(lines: List[str], prose: str, gaps: Optional[Dict[str, int]] = None
+                   ) -> Tuple[List[Optional[Tuple[int, int]]], List[Optional[int]]]:
+    """(span of each line in `prose` or None, pause after each line)."""
     g = dict(GAPS_MS, **(gaps or {}))
     letters, where = _letters(prose)
     mask = _speech_mask(prose)
@@ -676,7 +684,54 @@ def prose_pauses(lines: List[str], prose: str, gaps: Optional[Dict[str, int]] = 
         else:
             gap = g["line"]
         pauses.append(gap)
-    return pauses
+    return spans, pauses
+
+
+# One TTS call per "breath": OmniVoice reads a line as a finished utterance,
+# so fragments of one sentence, or several short sentences of one paragraph,
+# sound choppy when synthesised one by one.
+MAX_BREATH_CHARS = 240
+_STRESSED_WORD = re.compile(r"\w*\u0301\w*(?:\u0301\w*)*")
+
+
+def _carry_stress(text: str, prose_part: str) -> str:
+    """Copy the author's stress marks (U+0301) from the prose onto the same
+    words in the TTS text."""
+    for word in set(_STRESSED_WORD.findall(prose_part)):
+        plain = word.replace("\u0301", "")
+        if not plain:
+            continue
+        rx = re.compile(r"(?<!\w)" + re.escape(plain) + r"(?!\w)", re.IGNORECASE)
+        text = rx.sub(lambda m: m.group(0)[0] + word[1:] if m.group(0)[0] != word[0] else word, text)
+    return text
+
+
+def merge_breaths(items: List[Dict[str, Any]], prose: str, limit: int = MAX_BREATH_CHARS) -> List[Dict[str, Any]]:
+    """items: {text, tags, pause, span}. Join a line onto the previous one when
+    they are one sentence, or short sentences of one paragraph and one side of
+    the dialogue with the same delivery tags, up to `limit` characters."""
+    soft = {GAPS_MS["line"], GAPS_MS["question"], GAPS_MS["ellipsis"]}
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        prev = out[-1] if out else None
+        if (prev and prev["span"] and it["span"] and len(prev["text"]) + 1 + len(it["text"]) <= limit
+                and (prev["pause"] == GAPS_MS["continue"]
+                     or (prev["pause"] in soft and prev["tags"] == it["tags"]))):
+            text = it["text"]
+            if prev["pause"] == GAPS_MS["continue"]:
+                # "…в костях." + "Выбивая…" was cut from "…в костях, выбивая…"
+                prev["text"] = re.sub(r"(\.\.\.|…|\.)$", ",", prev["text"].rstrip())
+                if prose[it["span"][0]].islower():
+                    text = text[0].lower() + text[1:]
+            prev["text"] = f"{prev['text']} {text}"
+            prev["pause"] = it["pause"]
+            prev["span"] = (prev["span"][0], it["span"][1])
+        else:
+            out.append(dict(it))
+    for it in out:
+        if it["span"]:
+            it["text"] = _carry_stress(it["text"], prose[it["span"][0]:it["span"][1] + 1])
+    return out
 
 
 def convert_qwen_scenes(src_dir: str, voice: str, prose_dir: Optional[str] = None) -> str:
@@ -697,16 +752,18 @@ def convert_qwen_scenes(src_dir: str, voice: str, prose_dir: Optional[str] = Non
                   if t.strip()]
         if not blocks:
             continue
-        pauses: List[Optional[int]] = [None] * len(blocks)
+        items = [{"text": t, "tags": qwen_delivery(p), "pause": None, "span": None} for t, p in blocks]
         prose = read_text(os.path.join(prose_dir, name)) if prose_dir else None
         if prose:
-            pauses = prose_pauses([t for t, _ in blocks], prose)
+            spans, pauses = align_to_prose([t for t, _ in blocks], prose)
+            for it, span, pause in zip(items, spans, pauses):
+                it["span"], it["pause"] = span, pause
+            items = merge_breaths(items, prose)
         out.append(f"# Глава {ch:02d}, сцена {sc}")
         out.append(f"[voice:{voice}]")
-        for (text, prompt), pause in zip(blocks, pauses):
-            tags = qwen_delivery(prompt)
-            line = f"{tags} {text}" if tags else text
-            out.append(line if pause is None else f"{line} [pause {pause}ms]")
+        for it in items:
+            line = f"{it['tags']} {it['text']}" if it["tags"] else it["text"]
+            out.append(line if it["pause"] is None else f"{line} [pause {it['pause']}ms]")
         out.append("")
     return "\n".join(out)
 

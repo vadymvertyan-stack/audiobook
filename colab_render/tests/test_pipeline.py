@@ -320,6 +320,28 @@ class KaggleTest(BookFixture):
             g["line"], g["line"], 0,
         ])
 
+    def test_merge_breaths_from_prose(self):
+        lines = [
+            "Земля содрогалась, словно в предсмертных судорогах.",
+            "Каждое попадание ста пятидесяти двух миллиметрового снаряда отдавалось глубоко в костях.",
+            "Выбивая из легких остатки воздуха.",
+            "Андрей вжался в осыпающийся бруствер окопа.",
+            "Его камуфляж давно потерял первоначальный рисунок...",
+            "Превратившись в сплошную корку из засохшей глины.",
+            "Противник лезет по лесополке! Дайте огня, братики, нас тут сейчас размотают!",
+        ]
+        spans, pauses = orchestrate.align_to_prose(lines, self.PROSE)
+        items = [{"text": t, "tags": "", "pause": p, "span": sp} for t, p, sp in zip(lines, pauses, spans)]
+        got = [it["text"] for it in orchestrate.merge_breaths(items, self.PROSE)]
+        self.assertEqual(got, [
+            "Земля содрогалась, словно в предсмертных судорогах. Каждое попадание ста пятидесяти двух "
+            "миллиметрового снаряда отдавалось глубоко в костях, выбивая из легких остатки воздуха.",
+            # The author's stress mark comes along from the prose.
+            "Андре\u0301й вжался в осыпающийся бруствер окопа. Его камуфляж давно потерял первоначальный "
+            "рисунок, превратившись в сплошную корку из засохшей глины.",
+            "Противник лезет по лесополке! Дайте огня, братики, нас тут сейчас размотают!",
+        ])
+
     def test_explicit_pause_and_paragraph_win(self):
         lines = [{"voice": "Д", "text": "Раз.", "pause_after_ms": 2000},
                  {"voice": "Д", "text": "Два.", "paragraph_end": True},
@@ -336,7 +358,7 @@ class KaggleTest(BookFixture):
                     "ID: 0003\nText: Бежим.\nSystem_Prompt: Fast, urgent\n")
         lines = orchestrate.parse_book(orchestrate.convert_qwen_scenes(src, "Диктор"))[0]["lines"]
         self.assertEqual([(ln["text"], ln.get("speed"), ln.get("volume")) for ln in lines],
-                         [("Тихо.", 0.82, 0.55), ("— Огонь!", None, None), ("Бежим.", 1.08, None)])
+                         [("Тихо.", 0.82, 0.55), ("— Огонь!", 1.08, None), ("Бежим.", 1.08, None)])
 
     def test_reference_mismatch(self):
         text = "Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопье́сы."

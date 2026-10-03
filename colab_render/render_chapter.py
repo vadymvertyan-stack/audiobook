@@ -135,15 +135,17 @@ def wav_seconds(path: str) -> Optional[float]:
         return None
 
 
-def trim_silence(audio: np.ndarray, sr: int, threshold: float = 0.01, keep_ms: int = 40) -> np.ndarray:
+def trim_silence(audio: np.ndarray, sr: int, threshold: float = 0.002,
+                 lead_ms: int = 60, tail_ms: int = 150) -> np.ndarray:
+    # -54 dBFS and a generous tail: a final "с", "т" or breathy vowel is
+    # quiet, and cutting at -40 dB swallowed it.
     if audio.size == 0:
         return audio
     loud = np.flatnonzero(np.abs(audio) > threshold)
     if loud.size == 0:
         return audio
-    pad = int(sr * keep_ms / 1000)
-    start = max(0, loud[0] - pad)
-    end = min(audio.size, loud[-1] + pad + 1)
+    start = max(0, loud[0] - int(sr * lead_ms / 1000))
+    end = min(audio.size, loud[-1] + int(sr * tail_ms / 1000) + 1)
     return audio[start:end]
 
 
@@ -292,7 +294,10 @@ class OmniVoiceEngine:
         dtype = torch.float16 if device.startswith("cuda") else torch.float32
         log(f"loading {model_id} on {device}")
         self.model = OmniVoice.from_pretrained(model_id, device_map=device, dtype=dtype)
-        self.options = dict(options or {})
+        # OmniVoice fades the last 100 ms of every line, which eats a soft final
+        # consonant; keep only a click-guard fade. Edge silence is ours to set.
+        self.options = {"fade_duration": 0.02, "pad_duration": 0.0}
+        self.options.update(options or {})
         self.check_ref = bool(self.options.pop("check_ref", True))
 
     def prepare_voice(self, voice_name: str, voice: Dict[str, Any]) -> Any:
