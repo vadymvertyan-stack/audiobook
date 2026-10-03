@@ -559,6 +559,18 @@ class KaggleTest(BookFixture):
         self.assertEqual(len(calls), 2)
         self.assertIn("gdrive:Audiobook/test/01_Розділ_1_Ліс --include *.mp3", calls[0])
 
+    def test_omnivoice_gets_a_short_tail_of_extra_time(self):
+        from types import SimpleNamespace
+        eng = render_chapter.OmniVoiceEngine.__new__(render_chapter.OmniVoiceEngine)
+        eng.tail = 0.06
+        eng.model = SimpleNamespace(
+            _estimate_target_tokens=lambda text, ref, n, speed=1.0: int(len(text) * 2.5 / speed),
+            audio_tokenizer=SimpleNamespace(config=SimpleNamespace(frame_rate=25)))
+        prompt = SimpleNamespace(ref_text="x", ref_audio_tokens=SimpleNamespace(size=lambda dim: 100))
+        self.assertAlmostEqual(eng._duration_with_tail("a" * 20, prompt, 1.0), 2.0 + 0.15)   # short: 0.15 s floor
+        self.assertAlmostEqual(eng._duration_with_tail("a" * 100, prompt, 1.0), 10.0 + 0.4)  # long: 0.4 s cap
+        self.assertAlmostEqual(eng._duration_with_tail("a" * 50, prompt, 1.25), 4.0 + 0.24)
+
     def test_reference_mismatch(self):
         text = "Мой голос мужской, уверенный и ровный. Добро пожаловать в мир аудиопье́сы."
         self.assertIsNone(render_chapter.reference_mismatch(

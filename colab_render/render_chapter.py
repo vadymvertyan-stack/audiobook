@@ -325,8 +325,11 @@ class OmniVoiceEngine:
         self.check_ref = bool(self.options.pop("check_ref", True))
         # OmniVoice sizes each line from the reference's chars/second and the
         # model stops when that budget runs out, sometimes inside the last
-        # word. A few % more room lets it finish; extra silence is trimmed.
-        self.headroom = float(self.options.pop("headroom", 1.08))
+        # word. Stretching the whole budget (headroom) only slowed the speech
+        # down; instead the line gets a short extra tail of time on top of
+        # the estimate (6% of it, 0.15-0.4 s), and the trim removes what is left.
+        self.headroom = float(self.options.pop("headroom", 1.0))
+        self.tail = float(self.options.pop("tail", 0.06))
 
     def prepare_voice(self, voice_name: str, voice: Dict[str, Any]) -> Any:
         if self.check_ref:
@@ -353,10 +356,27 @@ class OmniVoiceEngine:
         if language:
             kwargs["language"] = language
         speed = speed / self.headroom
-        if abs(speed - 1.0) > 1e-3:
+        duration = self._duration_with_tail(text, prompt, speed)
+        if duration:
+            kwargs["duration"] = duration
+        elif abs(speed - 1.0) > 1e-3:
             kwargs["speed"] = speed
         audio = self.model.generate(text=text, voice_clone_prompt=prompt, **kwargs)
         return to_mono_float(audio[0] if isinstance(audio, (list, tuple)) else audio)
+
+
+    def _duration_with_tail(self, text: str, prompt: Any, speed: float) -> Optional[float]:
+        if self.tail <= 0:
+            return None
+        try:
+            frames = self.model._estimate_target_tokens(text, prompt.ref_text, prompt.ref_audio_tokens.size(-1),
+                                                        speed=speed)
+            seconds = frames / float(self.model.audio_tokenizer.config.frame_rate)
+        except Exception as e:  # an OmniVoice version without these internals
+            log(f"duration estimate unavailable ({e}); using speed only")
+            self.tail = 0.0
+            return None
+        return seconds + min(0.4, max(0.15, seconds * self.tail))
 
 
 class VoxCPM2Engine:
