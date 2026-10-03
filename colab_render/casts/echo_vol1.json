@@ -1,0 +1,44 @@
+{
+ "language": "Russian",
+ "takes": 3,
+ "characters": {
+  "Диктор": {
+   "narrator": true,
+   "voice": "Диктор",
+   "description": "Stable mature male narrator voice, low and even, consistent storytelling timbre",
+   "emotions": [
+    "tense",
+    "sad",
+    "whisper"
+   ]
+  },
+  "Андрей": {
+   "aliases": [
+    "Скиф"
+   ],
+   "description": "Male soldier in his early thirties, low hoarse voice, cold and cynical, short clipped phrases, tired from war",
+   "seed": 1101
+  },
+  "Лис": {
+   "description": "Young male soldier about twenty, light slightly nervous voice, informal, fast talker",
+   "seed": 1201
+  },
+  "Милонега": {
+   "description": "Female village healer about forty, warm soft low voice, absolutely calm, slow and gentle",
+   "emotions": [
+    "tense",
+    "sad",
+    "whisper"
+   ],
+   "seed": 1301
+  },
+  "Святополк": {
+   "description": "Middle-aged prince, deep authoritative voice, measured and suspicious, used to command",
+   "seed": 1401
+  },
+  "Ратибор": {
+   "description": "Older nobleman about fifty, arrogant and sly, smooth slightly nasal baritone, mocking tone",
+   "seed": 1501
+  }
+ }
+}
