@@ -10,9 +10,13 @@ command is short. You only run commands and read their JSON answer; you never
 edit Python files, voices.json or Kaggle settings.
 
 ```
-A=~/audiobook/colab_render/orchestrate.py
-P=~/audiobook-data/books/<slug>/book.json      # e.g. books/echo/book.json
+A=/home/vadym/audiobook/colab_render/audiobook.sh
+P=/home/vadym/audiobook-data/books/<slug>/book.json      # e.g. books/echo/book.json
 ```
+
+`audiobook.sh` runs the renderer as the user who owns it (vadym), where the
+Kaggle login and the Google Drive remote are, even when you run as root. Write
+commands below as `$A ...` .
 
 Every command prints one JSON line at the end. `"ok": true` means it worked.
 On `"ok": false`, tell the user the `problems` or `error` text in one or two
@@ -21,7 +25,7 @@ plain sentences and stop. Do not retry more than once.
 ## 1. Check before spending GPU (free, seconds)
 
 ```
-python3 $A plan --project $P --chapters 3
+$A plan --project $P --chapters 3
 ```
 
 Tell the user: chapters, voices used, `estimated_audio_minutes`. If `ok` is
@@ -31,7 +35,7 @@ user which name.
 ## 2. Render
 
 ```
-python3 $A render --project $P --chapters 3 --tag v1
+$A render --project $P --chapters 3 --tag v1
 ```
 
 - `--chapters` takes numbers like `1` or `1,2,5`. Without it the whole book is
@@ -59,7 +63,7 @@ narrator then sounds doubled with an accent (tested, rejected by the user).
 The user says e.g. «кобурЫ» (capital letter = stressed vowel).
 
 ```
-python3 $A lexicon --project $P кобуры кобуры́
+$A lexicon --project $P кобуры кобуры́
 ```
 
 - Write the stress as the vowel plus U+0301 (the combining acute, «ы́»), the
@@ -69,7 +73,7 @@ python3 $A lexicon --project $P кобуры кобуры́
 - If a mark is ignored (the user says it is still wrong), respell the sound:
   unstressed «о» -> «а» («кобуры» -> «кабуры́»), split letters with spaces or
   hyphens («АК-» -> «а-ка́ »).
-- Show the current entry: `python3 $A lexicon --project $P кобуры`.
+- Show the current entry: `$A lexicon --project $P кобуры`.
   Remove one: add `--remove`.
 - Then re-render the chapter with the next `--tag`; only lines with that
   word change, but the whole chapter is re-uploaded.
@@ -80,7 +84,7 @@ Voices are already designed for the book's main characters. Only when the user
 asks for a new character or a new voice:
 
 ```
-python3 $A cast --project $P --characters Имя
+$A cast --project $P --characters Имя
 ```
 
 This takes 15-30 minutes on Kaggle. The character must be described in the
