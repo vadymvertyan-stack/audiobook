@@ -433,6 +433,67 @@ class KaggleTest(BookFixture):
         before = next(ln for ln in lines if ln["text"].startswith("Квадрат"))
         self.assertEqual(before["pause_after_ms"], orchestrate.GAPS_MS["attribution"])
 
+    def test_agent_workflow_speech_line_prepare_character(self):
+        src, prose_dir = os.path.join(self.tmp, "qwen"), os.path.join(self.tmp, "prose")
+        os.makedirs(src)
+        os.makedirs(prose_dir)
+        name = "vol1_chapter_01_scene1.md"
+        with open(os.path.join(src, name), "w", encoding="utf-8") as f:
+            f.write("\n---\n".join(f"ID: {i:04d}\nText: {t}\nSystem_Prompt: Calm"
+                                    for i, t in enumerate(self.SCENE_LINES, 1)))
+        with open(os.path.join(prose_dir, name), "w", encoding="utf-8") as f:
+            f.write(self.PROSE)
+        cast = os.path.join(self.tmp, "cast.json")
+        with open(cast, "w", encoding="utf-8") as f:
+            json.dump({"characters": {"Диктор": {"narrator": True, "voice": "Диктор", "description": "x"},
+                                      "Андрей": {"aliases": ["Скиф"], "description": "x", "seed": 1101}}},
+                      f, ensure_ascii=False)
+        with open(self.voices, encoding="utf-8") as f:
+            vs = json.load(f)
+        vs["Андрей"] = dict(vs["Диктор"])
+        vs["Лис"] = dict(vs["Диктор"])
+        with open(self.voices, "w", encoding="utf-8") as f:
+            json.dump(vs, f, ensure_ascii=False)
+        proj = os.path.join(self.tmp, "book.json")
+        with open(proj, "w", encoding="utf-8") as f:
+            json.dump({"book": "script.txt", "voices": self.voices, "src": "qwen", "prose": "prose",
+                       "speakers": "speakers.json", "edits": "edits.json", "cast": "cast.json"}, f)
+        speakers = os.path.join(self.tmp, "speakers.json")
+        captured = []
+        real_emit = orchestrate.emit
+        orchestrate.emit = lambda obj: captured.append(obj)
+        try:
+            # A new character, then the agent names the speaker of stretch 3.
+            self.assertEqual(orchestrate.main(["character", "--project", proj, "Лис", "--description",
+                                               "young male soldier", "--gender", "male"]), 0)
+            self.assertEqual(orchestrate.main(["speech", "--project", proj, "--chapters", "глава 1"]), 0)
+            rows = captured[-1]["scenes"][0]["stretches"]
+            self.assertEqual(len(rows), 4)
+            self.assertIn("прошептал", rows[2]["after"])
+            self.assertEqual(orchestrate.main(["speech", "--project", proj, "--chapters", "глава 1, сцена 1",
+                                               "--set", "3=Лис", "4=Лис"]), 0)
+            self.assertEqual(orchestrate.main(["speech", "--project", proj, "--chapters", "глава 1",
+                                               "--set", "1=Ромео"]), 2)  # not in the cast
+            self.assertEqual(orchestrate.main(["prepare", "--project", proj]), 0)
+            self.assertEqual(orchestrate.main(["line", "--project", proj, "--chapters", "глава 1"]), 0)
+            lines = captured[-1]["scenes"][0]["lines"]
+            they = next(ln for ln in lines if ln["text"].startswith("Они нас"))
+            self.assertEqual(they["voice"], "Лис")
+            self.assertEqual(orchestrate.main(["line", "--project", proj, "--chapters", "глава 1, сцена 1",
+                                               "--id", they["id"], "--emotion", "whisper", "--pause", "900"]), 0)
+            # A re-import keeps the edit.
+            self.assertEqual(orchestrate.main(["prepare", "--project", proj]), 0)
+            self.assertEqual(captured[-1]["stale_edits"], [])
+            self.assertEqual(orchestrate.main(["line", "--project", proj, "--chapters", "глава 1"]), 0)
+            they = next(ln for ln in captured[-1]["scenes"][0]["lines"] if ln["text"].startswith("Они нас"))
+            self.assertEqual((they["emotion"], they["pause_after_ms"]), ("whisper", 900))
+        finally:
+            orchestrate.emit = real_emit
+        with open(speakers, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)[name][2]["how"], "agent")
+        with open(cast, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["characters"]["Лис"]["seed"], 1201)
+
     def test_merge_breaths_from_prose(self):
         lines = [
             "Земля содрогалась, словно в предсмертных судорогах.",

@@ -622,6 +622,9 @@ def select_chapters(chapters: List[Dict[str, Any]], spec: str) -> List[Dict[str,
 def load_book(args: argparse.Namespace):
     with open(args.book, encoding="utf-8") as f:
         chapters = parse_book(f.read(), args.default_voice)
+    stale = apply_edits(chapters, load_edits(getattr(args, "edits", None)))
+    if stale:
+        note(f"{len(stale)} line edit(s) no longer match the script: {'; '.join(stale[:5])}")
     if args.chapters:
         chapters = select_chapters(chapters, args.chapters)
     voices = load_voices(args.voices)
@@ -1129,6 +1132,212 @@ def cmd_import_qwen(args: argparse.Namespace) -> int:
     emit({"ok": True, "out": args.out, "chapters": len(chapters),
           "lines": sum(len(c["lines"]) for c in chapters),
           "chars": sum(len(ln["text"]) for c in chapters for ln in c["lines"])})
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Editing by an agent: who speaks, per-line delivery, new characters
+# ---------------------------------------------------------------------------
+# The script is rebuilt from the scene files by `prepare`, so hand edits to it
+# would be lost. Speakers live in speakers.json, line edits in edits.json
+# ({scene title: [{"anchor": original line text, "set": {...}}]}); both are
+# applied on every import and render.
+
+LINE_FIELDS = {"voice", "emotion", "speed", "volume", "pause_after_ms", "text"}
+
+
+def load_edits(path: Optional[str]) -> Dict[str, List[Dict[str, Any]]]:
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def apply_edits(chapters: List[Dict[str, Any]], edits: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    stale = []
+    by_title = {_title_key(c["title"]): c for c in chapters}
+    for title, items in edits.items():
+        ch = by_title.get(_title_key(title))
+        for e in items:
+            ln = next((x for x in (ch or {}).get("lines", []) if x["text"] == e["anchor"]), None)
+            if ln is None:
+                stale.append(f"{title}: {e['anchor'][:40]}")
+                continue
+            for k, v in e["set"].items():
+                if v is None:
+                    ln.pop(k, None)
+                else:
+                    ln[k] = v
+    return stale
+
+
+def _scene_file(names: List[str], title: str) -> Optional[str]:
+    m = re.search(r"(\d+)\D+(\d+)", title)
+    if not m:
+        return None
+    want = (int(m.group(1)), int(m.group(2)))
+    for n in names:
+        f = QWEN_SCENE_FILE.search(n)
+        if f and (int(f.group(1)), int(f.group(2))) == want:
+            return n
+    return None
+
+
+def _scene_title(name: str) -> str:
+    m = QWEN_SCENE_FILE.search(name)
+    return f"Глава {int(m.group(1)):02d}, сцена {int(m.group(2))}" if m else name
+
+
+def _write_json(path: str, data: Any) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def cmd_speech(args: argparse.Namespace) -> int:
+    """List each stretch of direct speech with the author's words around it,
+    or set who says it. An agent reads the context and names the speaker."""
+    names = sorted(n for n in os.listdir(args.prose) if QWEN_SCENE_FILE.search(n))
+    titles = [{"title": _scene_title(n), "index": i} for i, n in enumerate(names, 1)]
+    speakers = load_edits(args.speakers)  # same JSON shape: {file: [...]}
+    cast = load_cast_names(args.cast)
+    genders = cast_genders(args.cast)
+    if args.set:
+        if not args.chapters:
+            raise ValueError("--set needs --chapters naming one scene, e.g. \"глава 2, сцена 1\"")
+        picked = select_chapters([dict(t) for t in titles], args.chapters)
+        if len(picked) != 1:
+            raise ValueError(f"--set needs exactly one scene, '{args.chapters}' matches {len(picked)}")
+        names = [names[picked[0]["index"] - 1]]
+    elif args.chapters:
+        names = [names[t["index"] - 1] for t in select_chapters([dict(t) for t in titles], args.chapters)]
+    allowed = set(cast) | {args.narrator}
+    out = []
+    changed = False
+    for name in names:
+        prose = read_text(os.path.join(args.prose, name)) or ""
+        runs = speech_runs(prose)
+        entries = speakers.get(name)
+        if entries is None or len(entries) != len(runs):
+            guessed = guess_speakers(prose, cast, genders)
+            entries = [{"n": n, "text": prose[a:b + 1][:120], "speaker": g, "how": "verb+name" if g else None}
+                       for n, ((a, b), g) in enumerate(zip(runs, guessed), 1)]
+            speakers[name] = entries
+            changed = True
+        for item in args.set or []:
+            n, _, who = item.partition("=")
+            who = who.strip()
+            if who and who not in allowed:
+                raise ValueError(f"'{who}' is not in the cast ({', '.join(sorted(allowed))}); "
+                                 f"add the character first")
+            e = next((e for e in entries if str(e["n"]) == n.strip()), None)
+            if e is None:
+                raise ValueError(f"no speech stretch {n} in {_scene_title(name)} (1-{len(entries)})")
+            e["speaker"] = None if who in ("", args.narrator) else who
+            e["how"] = "agent"
+            changed = True
+        rows = []
+        for e, (a, b) in zip(entries, runs):
+            rows.append({"n": e["n"], "speaker": e.get("speaker"), "speech": prose[a:b + 1][:200],
+                         "before": prose[max(0, a - 120):a].replace("\n", " ")[-120:],
+                         "after": prose[b + 1:b + 121].replace("\n", " ")})
+        out.append({"scene": _scene_title(name), "unknown": sum(1 for r in rows if not r["speaker"]),
+                    "stretches": rows if not args.set else []})
+    if changed:
+        _write_json(args.speakers, speakers)
+    emit({"ok": True, "cast": sorted(cast), "scenes": out,
+          "note": "after setting speakers run `prepare` so the script picks them up" if args.set else None})
+    return 0
+
+
+def cmd_line(args: argparse.Namespace) -> int:
+    """Show a scene's lines, or change one line's voice, emotion, tempo,
+    loudness, pause or text. Edits survive `prepare`."""
+    with open(args.book, encoding="utf-8") as f:
+        chapters = parse_book(f.read(), args.default_voice)
+    edits = load_edits(args.edits)
+    apply_edits(chapters, edits)
+    picked = select_chapters(chapters, args.chapters)
+    changes = {k: getattr(args, k) for k in ("voice", "emotion", "speed", "volume", "text")
+               if getattr(args, k) is not None}
+    if args.pause is not None:
+        changes["pause_after_ms"] = args.pause
+    if not changes:
+        emit({"ok": True, "scenes": [
+            {"scene": c["title"], "lines": [
+                {"id": ln["id"], "voice": ln["voice"], "emotion": ln.get("emotion"), "speed": ln.get("speed"),
+                 "pause_after_ms": ln.get("pause_after_ms"), "text": ln["text"]} for ln in c["lines"]]}
+            for c in picked]})
+        return 0
+    if len(picked) != 1 or not args.id:
+        raise ValueError("to change a line give --chapters naming one scene and --id")
+    ch = picked[0]
+    ln = next((x for x in ch["lines"] if x["id"] == args.id.zfill(4)), None)
+    if ln is None:
+        raise ValueError(f"no line {args.id} in {ch['title']}")
+    if changes.get("emotion") in ("none", "calm"):
+        changes["emotion"] = None
+    # Anchor on the text the import produces, so the edit finds its line again.
+    with open(args.book, encoding="utf-8") as f:
+        original = next(c for c in parse_book(f.read(), args.default_voice) if c["title"] == ch["title"])
+    anchor = next(x["text"] for x in original["lines"] if x["id"] == ln["id"])
+    items = edits.setdefault(ch["title"], [])
+    entry = next((e for e in items if e["anchor"] == anchor), None)
+    if entry is None:
+        entry = {"anchor": anchor, "set": {}}
+        items.append(entry)
+    entry["set"].update(changes)
+    _write_json(args.edits, edits)
+    emit({"ok": True, "scene": ch["title"], "id": ln["id"], "set": entry["set"],
+          "note": "re-render this scene with the next --tag to hear it"})
+    return 0
+
+
+def cmd_prepare(args: argparse.Namespace) -> int:
+    """Rebuild the script from the scene files with the current speakers."""
+    with open(args.speakers, encoding="utf-8") as f:
+        speakers = json.load(f) if os.path.getsize(args.speakers) else {}
+    voices = load_voices(args.voices)
+    script = convert_qwen_scenes(args.src, args.narrator, args.prose, speakers, voices)
+    if os.path.exists(args.book):
+        shutil.copy(args.book, args.book + ".bak")
+    with open(args.book, "w", encoding="utf-8") as f:
+        f.write(script)
+    chapters = parse_book(script)
+    stale = apply_edits(chapters, load_edits(getattr(args, "edits", None)))
+    emit({"ok": True, "book": args.book, "scenes": len(chapters),
+          "narrator_only_scenes": [c["title"] for c in chapters
+                                   if all(ln["voice"].split(":")[0] == args.narrator for ln in c["lines"])],
+          "stale_edits": stale})
+    return 0
+
+
+def cmd_character(args: argparse.Namespace) -> int:
+    """Add or change a character in the cast file (then run `cast` for it)."""
+    with open(args.cast, encoding="utf-8") as f:
+        spec = json.load(f)
+    chars = spec.setdefault("characters", {})
+    if not args.name:
+        emit({"ok": True, "characters": {n: {k: v for k, v in c.items() if k != "seed"} for n, c in chars.items()}})
+        return 0
+    ch = chars.setdefault(args.name, {})
+    if args.description:
+        ch["description"] = args.description
+    if args.gender:
+        ch["gender"] = args.gender
+    if args.aliases is not None:
+        ch["aliases"] = [a.strip() for a in args.aliases.split(",") if a.strip()]
+    if args.emotions is not None:
+        ch["emotions"] = [e.strip() for e in args.emotions.split(",") if e.strip()]
+    if "seed" not in ch:
+        ch["seed"] = max([c.get("seed", 1000) for c in chars.values()] + [1000]) + 100
+    if not ch.get("description"):
+        raise ValueError("a new character needs --description (an English description of the voice)")
+    shutil.copy(args.cast, args.cast + ".bak")
+    _write_json(args.cast, spec)
+    emit({"ok": True, "character": args.name, "entry": ch,
+          "next": f"cast --characters {args.name}, then speech --set ... and prepare"})
     return 0
 
 
@@ -1747,6 +1956,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--voices", default=None, help="voices.json or old voice_library.json")
         sp.add_argument("--default-voice", default=None, help="voice for text before the first tag")
         sp.add_argument("--chapters", default=None, help="only these chapter numbers, e.g. 1,2,5")
+        sp.add_argument("--edits", default=None, help="edits.json from the `line` command")
 
     sp = sub.add_parser("plan", help="validate script and voices, no GPU")
     book_args(sp)
@@ -1827,6 +2037,45 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--remove", action="store_true", help="delete the entry for the word")
     sp.set_defaults(func=cmd_lexicon)
 
+    sp = sub.add_parser("speech", help="list direct speech with context, or set who says it")
+    sp.add_argument("--chapters", default=None, help="scenes, e.g. \"глава 2\" or \"глава 2, сцена 1\"")
+    sp.add_argument("--set", nargs="*", default=None, metavar="N=NAME",
+                    help="who says stretch N of the one scene in --chapters; NAME empty or the narrator = narrator")
+    sp.add_argument("--prose", default=None)
+    sp.add_argument("--speakers", default=None)
+    sp.add_argument("--cast", default=None)
+    sp.add_argument("--narrator", default="Диктор")
+    sp.set_defaults(func=cmd_speech)
+
+    sp = sub.add_parser("line", help="show a scene's lines or change one (voice, emotion, speed, pause, text)")
+    sp.add_argument("--chapters", required=True, help="the scene, e.g. \"глава 2, сцена 1\"")
+    sp.add_argument("--id", default=None, help="line id from the listing, e.g. 0012")
+    sp.add_argument("--voice", default=None)
+    sp.add_argument("--emotion", default=None, help="tense, shout, whisper, sad, or none")
+    sp.add_argument("--speed", type=float, default=None)
+    sp.add_argument("--volume", type=float, default=None)
+    sp.add_argument("--pause", type=int, default=None, help="pause after the line, ms")
+    sp.add_argument("--text", default=None, help="new text for this line only")
+    sp.add_argument("--book", default=None)
+    sp.add_argument("--edits", default=None)
+    sp.add_argument("--default-voice", default=None)
+    sp.set_defaults(func=cmd_line)
+
+    sp = sub.add_parser("prepare", help="rebuild the script from the scene files with the current speakers")
+    for opt in ("--src", "--prose", "--speakers", "--voices", "--book", "--edits"):
+        sp.add_argument(opt, default=None)
+    sp.add_argument("--narrator", default="Диктор")
+    sp.set_defaults(func=cmd_prepare)
+
+    sp = sub.add_parser("character", help="add or change a character in the cast file; no name lists them")
+    sp.add_argument("name", nargs="?", default=None)
+    sp.add_argument("--description", default=None, help="English description of the voice")
+    sp.add_argument("--gender", default=None, choices=["male", "female"])
+    sp.add_argument("--aliases", default=None, help="other names, comma separated")
+    sp.add_argument("--emotions", default=None, help="comma separated, default tense,shout,whisper,sad")
+    sp.add_argument("--cast", default=None)
+    sp.set_defaults(func=cmd_character)
+
     sp = sub.add_parser("assemble", help="rebuild chapter.wav and stems from lines/")
     sp.add_argument("chapter_dir")
     sp.set_defaults(func=cmd_assemble)
@@ -1865,9 +2114,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # Settings that hold file paths; in a project file they are relative to it.
-PROJECT_PATHS = {"book", "voices", "lexicon", "out", "cast", "convert_existing"}
+PROJECT_PATHS = {"book", "voices", "lexicon", "out", "cast", "convert_existing", "src", "prose", "speakers", "edits"}
 REQUIRED = {"plan": ["book", "voices"], "render": ["book", "voices", "out"], "cast": ["cast", "out"],
-            "lexicon": ["lexicon"]}
+            "lexicon": ["lexicon"], "speech": ["prose", "speakers", "cast"], "line": ["book", "edits"],
+            "prepare": ["src", "prose", "speakers", "voices", "book"], "character": ["cast"]}
 
 
 def load_project(path: str, command: str) -> Dict[str, Any]:
