@@ -1154,9 +1154,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
             {"index": c["index"], "title": c["title"], "lines": len(c["lines"]),
              "chars": sum(len(ln["text"]) for ln in c["lines"]),
              "voices": sorted({ln["voice"] for ln in c["lines"]}),
-             # Direct speech still read by the narrator: nobody was assigned to it.
-             "unassigned_speech": sum(1 for ln in c["lines"] if ln["voice"].split(":")[0] == narrator
-                                      and ln["text"].lstrip().startswith(("—", "–")))}
+             # No character voice at all: the speakers were never assigned
+             # (attribute), so the narrator would read the dialogue too.
+             "narrator_only": all(ln["voice"].split(":")[0] == narrator for ln in c["lines"])}
             for c in chapters
         ],
         "total_chars": chars,

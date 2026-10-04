@@ -42,9 +42,9 @@ $A plan --project $P --chapters "глава 2"
 
 Tell the user: scenes, voices used, `estimated_audio_minutes`. If `ok` is
 false, the usual cause is a speaker name that is not in voices.json: tell the
-user which name. If a scene has `unassigned_speech` above 0, its characters'
-lines would be read by the narrator: tell the user how many and ask whether to
-render anyway.
+user which name. If a scene has `"narrator_only": true`, nobody has assigned
+its dialogue to characters yet, so the narrator would read every line: tell the
+user and ask whether to render anyway.
 
 ## 2. Render
 
