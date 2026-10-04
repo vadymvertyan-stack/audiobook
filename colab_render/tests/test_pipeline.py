@@ -667,6 +667,18 @@ class KaggleTest(BookFixture):
         with open(lx, encoding="utf-8") as f:
             self.assertEqual(json.load(f), {})
 
+    def test_select_chapters_by_number_or_title(self):
+        chs = [{"index": i, "title": t} for i, t in enumerate(
+            ["Глава 01, сцена 1", "Глава 01, сцена 2", "Глава 02, сцена 1", "Глава 12, сцена 1"], 1)]
+        pick = lambda spec: [c["index"] for c in orchestrate.select_chapters(chs, spec)]
+        self.assertEqual(pick("1,3-4"), [1, 3, 4])
+        self.assertEqual(pick("глава 2"), [3])
+        self.assertEqual(pick("Глава 1, сцена 2"), [2])
+        self.assertEqual(pick("глава_01_сцена_2"), [2])
+        self.assertEqual(pick("глава 2; глава 12"), [3, 4])
+        with self.assertRaises(ValueError):
+            pick("глава 7")
+
     def test_render_publishes_mp3_with_rclone(self):
         log = os.path.join(self.tmp, "rclone.log")
         fake = os.path.join(self.tmp, "rclone")

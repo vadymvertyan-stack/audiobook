@@ -1,6 +1,6 @@
 ---
 name: audiobook-play
-description: Render a Russian or Ukrainian audio play (several voices, emotions) on a free Kaggle GPU with orchestrate.py, fix word stresses, and put the mp3 on Google Drive. Use when the user asks to voice a scene, chapter or book, to fix how a word is pronounced, or asks what is rendering.
+description: Voice (озвучить / озвучити) a scene, chapter or book of an audio play such as «Эхо последнего рубежа» on a free Kaggle GPU, fix a word's stress (наголос / ударение), and put the mp3 on Google Drive. Use for any request to voice, render or re-render a chapter, fix a stress, or ask what is rendering.
 ---
 
 # Audio play renderer
@@ -22,24 +22,37 @@ Every command prints one JSON line at the end. `"ok": true` means it worked.
 On `"ok": false`, tell the user the `problems` or `error` text in one or two
 plain sentences and stop. Do not retry more than once.
 
+Facts you need:
+- The GPU is on Kaggle, not on this server. You never need a GPU here and
+  never look for the book text yourself: the script is already prepared.
+- Book slugs: `echo` = «Эхо последнего рубежа», volume 1 (Том 1, 16 chapters,
+  47 scenes). Volume 2 is not prepared; say so if asked.
+- The script's parts are scenes, titled «Глава 02, сцена 1». Pass words from
+  the titles to `--chapters`: `--chapters "глава 2"` (all its scenes),
+  `--chapters "глава 2, сцена 1"`, several with `;`. Numbers also work
+  (`--chapters 4-6`).
+- Version names like "v15a" are only file names (`--tag`). The approved sound
+  settings are in the book file; never try to recreate a "version".
+
 ## 1. Check before spending GPU (free, seconds)
 
 ```
-$A plan --project $P --chapters 3
+$A plan --project $P --chapters "глава 2"
 ```
 
-Tell the user: chapters, voices used, `estimated_audio_minutes`. If `ok` is
+Tell the user: scenes, voices used, `estimated_audio_minutes`. If `ok` is
 false, the usual cause is a speaker name that is not in voices.json: tell the
-user which name.
+user which name. If a scene has `unassigned_speech` above 0, its characters'
+lines would be read by the narrator: tell the user how many and ask whether to
+render anyway.
 
 ## 2. Render
 
 ```
-$A render --project $P --chapters 3 --tag v1
+$A render --project $P --chapters "глава 2" --tag v1
 ```
 
-- `--chapters` takes numbers like `1` or `1,2,5`. Without it the whole book is
-  rendered (hours; ask the user first if the book has more than 5 chapters).
+- Without `--chapters` the whole book is rendered (6-7 hours): ask first.
 - `--tag` names the uploaded file `<chapter>_<tag>.mp3` on Google Drive. Use
   the next free version (v1, v2, ...) for a re-render of the same chapter.
 - The command waits until Kaggle finishes: about 5 minutes per 6 minutes of

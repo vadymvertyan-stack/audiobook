@@ -591,12 +591,39 @@ def load_settings(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def _title_key(text: str) -> str:
+    # "Глава_01_сцена_1" and "глава 1, сцена 1" compare equal.
+    text = re.sub(r"[_\W]+", " ", text.lower())
+    return re.sub(r"\b0+(\d)", r"\1", text).strip()
+
+
+def select_chapters(chapters: List[Dict[str, Any]], spec: str) -> List[Dict[str, Any]]:
+    """--chapters takes numbers ("1,4-6") or words from the titles ("глава 2",
+    "глава 1, сцена 3", "глава 2; глава 3"); a word match picks every part
+    whose title contains it."""
+    spec = spec.strip()
+    if re.fullmatch(r"[\d,\s-]+", spec):
+        wanted = set()
+        for part in filter(None, (x.strip() for x in spec.split(","))):
+            a, _, b = part.partition("-")
+            wanted.update(range(int(a), int(b or a) + 1))
+        picked = [c for c in chapters if c["index"] in wanted]
+    else:
+        # Titles contain commas ("Глава 02, сцена 1"), so several word
+        # filters are separated with ";".
+        keys = [_title_key(x) for x in spec.split(";") if x.strip()]
+        picked = [c for c in chapters
+                  if any(re.search(r"(^|\s)" + re.escape(k) + r"(\s|$)", _title_key(c["title"])) for k in keys)]
+    if not picked:
+        raise ValueError(f"no chapter matches '{spec}'; run plan without --chapters to see the titles")
+    return picked
+
+
 def load_book(args: argparse.Namespace):
     with open(args.book, encoding="utf-8") as f:
         chapters = parse_book(f.read(), args.default_voice)
     if args.chapters:
-        wanted = {int(x) for x in args.chapters.split(",")}
-        chapters = [c for c in chapters if c["index"] in wanted]
+        chapters = select_chapters(chapters, args.chapters)
     voices = load_voices(args.voices)
     resolve_emotions(chapters, voices)
     return chapters, voices
@@ -1109,6 +1136,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
     chapters, voices = load_book(args)
     problems = check_voices(chapters, voices)
     chars = sum(len(ln["text"]) for c in chapters for ln in c["lines"])
+    counts: Dict[str, int] = {}
+    for c in chapters:
+        for ln in c["lines"]:
+            counts[ln["voice"].split(":")[0]] = counts.get(ln["voice"].split(":")[0], 0) + 1
+    narrator = args.default_voice or max(counts, key=counts.get, default="")
     if args.gaps:
         for c in chapters:
             lines = [dict(ln) for ln in c["lines"]]
@@ -1121,7 +1153,10 @@ def cmd_plan(args: argparse.Namespace) -> int:
         "chapters": [
             {"index": c["index"], "title": c["title"], "lines": len(c["lines"]),
              "chars": sum(len(ln["text"]) for ln in c["lines"]),
-             "voices": sorted({ln["voice"] for ln in c["lines"]})}
+             "voices": sorted({ln["voice"] for ln in c["lines"]}),
+             # Direct speech still read by the narrator: nobody was assigned to it.
+             "unassigned_speech": sum(1 for ln in c["lines"] if ln["voice"].split(":")[0] == narrator
+                                      and ln["text"].lstrip().startswith(("—", "–")))}
             for c in chapters
         ],
         "total_chars": chars,
