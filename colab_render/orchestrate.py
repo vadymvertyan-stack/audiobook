@@ -1239,9 +1239,12 @@ def cmd_speech(args: argparse.Namespace) -> int:
             changed = True
         rows = []
         for e, (a, b) in zip(entries, runs):
+            before = prose[max(0, a - 220):a].replace("\n", " ")
+            after = prose[b + 1:b + 161].replace("\n", " ")
+            if a > 220:
+                before = before.split(" ", 1)[-1]  # start on a whole word
             rows.append({"n": e["n"], "speaker": e.get("speaker"), "speech": prose[a:b + 1][:200],
-                         "before": prose[max(0, a - 120):a].replace("\n", " ")[-120:],
-                         "after": prose[b + 1:b + 121].replace("\n", " ")})
+                         "before": before, "after": after.rsplit(" ", 1)[0]})
         out.append({"scene": _scene_title(name), "unknown": sum(1 for r in rows if not r["speaker"]),
                     "stretches": rows if not args.set else []})
     if changed:
